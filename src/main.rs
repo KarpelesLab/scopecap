@@ -1,6 +1,7 @@
 mod app;
 mod autoflat;
 mod camera;
+mod composite;
 mod config;
 mod mosaic;
 mod proc;

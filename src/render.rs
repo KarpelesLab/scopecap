@@ -8,7 +8,8 @@
 use crate::autoflat;
 use crate::config::{self, Settings};
 use crate::mosaic::{self, Mosaic, Track};
-use crate::proc::{self, Correction, Flat, Lin};
+use crate::composite::{Compositor, Placed};
+use crate::proc::{self, Correction, Flat, Levels, Lin};
 use crate::project::{mag_label, Project};
 use crate::recorder::{read_jsonl, FrameRec, SessionInfo};
 use crate::reference::{Reference, Sim};
@@ -37,13 +38,15 @@ pub struct Opts {
     pub install_flat: bool,
     /// Keep pieces separate (debugging).
     pub no_join: bool,
+    /// Per-frame brightness/colour correction.
+    pub gains: bool,
 }
 
-const USAGE: &str = "usage: scopecap render <scan-or-project-dir> [--flat auto|live|none] [--max-speed PX] [--out DIR] [--install-flat] [--no-join]";
+const USAGE: &str = "usage: scopecap render <scan-or-project-dir> [--flat auto|live|none] [--max-speed PX] [--out DIR] [--install-flat] [--no-gains] [--no-join]";
 
 pub fn main(args: &[String]) -> Result<()> {
     let mut dir = None;
-    let mut o = Opts { flat: FlatMode::Auto, max_speed: 2.0, out: None, install_flat: false, no_join: false };
+    let mut o = Opts { flat: FlatMode::Auto, max_speed: 2.0, out: None, install_flat: false, no_join: false, gains: true };
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -59,6 +62,7 @@ pub fn main(args: &[String]) -> Result<()> {
             "--out" => o.out = Some(it.next().context(USAGE)?.into()),
             "--install-flat" => o.install_flat = true,
             "--no-join" => o.no_join = true,
+            "--no-gains" => o.gains = false,
             s if !s.starts_with('-') && dir.is_none() => dir = Some(PathBuf::from(s)),
             _ => bail!("{USAGE}"),
         }
@@ -122,6 +126,7 @@ fn run_scan(dir: &Path, o: &Opts) -> Result<()> {
     let out = o.out.clone().unwrap_or_else(|| dir.join(format!("render-{}", config::timestamp())));
     std::fs::create_dir_all(&out)?;
     let r = render_layer(&sessions, o, &out, || None)?;
+    let lv = r.pieces[0].levels();
     let meta = serde_json::json!({
         "source": "scopecap render",
         "session": dir.file_name().map(|s| s.to_string_lossy().into_owned()),
@@ -129,7 +134,7 @@ fn run_scan(dir: &Path, o: &Opts) -> Result<()> {
         "max_speed": o.max_speed,
         "states": r.states,
     });
-    let p = r.mosaic.export_with(&out, meta)?;
+    let p = export(&r.pieces, &out, lv, meta)?;
     println!(
         "wrote {}×{} px mosaic ({} tiles, {} levels) → {}/index.html in {:.1}s",
         p.width,
@@ -142,16 +147,33 @@ fn run_scan(dir: &Path, o: &Opts) -> Result<()> {
     Ok(())
 }
 
+/// Main piece into `dir`, any others into `dir/pieces/<n>`.
+fn export(pieces: &[Compositor], dir: &Path, lv: Levels, meta: serde_json::Value) -> Result<crate::pyramid::PyramidInfo> {
+    let mut main = None;
+    for (n, c) in pieces.iter().enumerate() {
+        let d = if n == 0 { dir.to_path_buf() } else { dir.join(format!("pieces/{n}")) };
+        let mut meta = meta.clone();
+        meta["levels"] = serde_json::json!([lv.lo, lv.hi]);
+        meta["pieces"] = pieces.len().into();
+        let info = crate::pyramid::write(&d, &c.keys(), |k| c.rgba(k, lv), meta)?;
+        main.get_or_insert(info);
+    }
+    main.context("nothing to export")
+}
+
 /// All layers of a project, low to high magnification.
 fn run_project(dir: &Path, o: &Opts) -> Result<()> {
     let t_start = Instant::now();
     let mut project = Project::load(dir)?;
     let out = o.out.clone().unwrap_or_else(|| dir.join(format!("render-{}", config::timestamp())));
     std::fs::create_dir_all(&out)?;
-    // Per layer: snapshot (reference for children) and project transform
-    // (layer px → project px, the project being the lowest layer's pixels).
+    // Per rendered layer: its composite as a canvas (reference for the next
+    // layer, colour target) and its transform into project coordinates
+    // (the lowest layer's pixels).
     let mut done: HashMap<u32, (Arc<mosaic::Canvas>, Sim)> = HashMap::new();
     let mut view_layers = Vec::new();
+    // One set of levels for every layer, from the lowest: all look alike.
+    let mut levels: Option<Levels> = None;
     let order: Vec<_> = project.ordered().into_iter().cloned().collect();
     for layer in order {
         let dirs = project.session_dirs(dir, &layer);
@@ -167,27 +189,39 @@ fn run_project(dir: &Path, o: &Opts) -> Result<()> {
         let make_ref = || {
             parent
                 .as_ref()
-                .map(|((canvas, _), pmag)| Reference::new(canvas.clone(), (*pmag / layer.mag) as f64, layer.hint, layer.map))
+                .map(|((canvas, _), pmag)| {
+                    // Layer coordinates start at the first placed frame, which
+                    // differs between runs: never reuse a stored mapping.
+                    Reference::new(canvas.clone(), (*pmag / layer.mag) as f64, None, None)
+                })
         };
         let ldir = out.join(&layer.dir);
-        let r = render_layer(&sessions, o, &ldir, make_ref)?;
-        let map = r.mosaic.layer_map();
+        let mut r = render_layer(&sessions, o, &ldir, make_ref)?;
+        let map = r.map;
         if let Some(m) = map {
             println!("   mapping onto parent: scale {:.5}, offset ({:.1}, {:.1})", m.s, m.tx, m.ty);
             if let Some(l) = project.layer_mut(layer.id) {
                 l.map = Some(m);
             }
         }
+        // Colour/brightness matched to the layer below.
+        if let (Some(((pc, _), _)), Some(m)) = (&parent, map) {
+            if let Some(g) = r.pieces[0].color_match(pc, m) {
+                println!("   colour matched to the layer below: R×{:.3} G×{:.3} B×{:.3}", g[0], g[1], g[2]);
+                r.pieces[0].gain = g;
+            }
+        }
+        let lv = *levels.get_or_insert_with(|| r.pieces[0].levels());
         // Compose with the parent's transform into project coordinates.
         let to_project = match (&parent, map) {
             (Some(((_, pt), _)), Some(m)) => crate::project::compose(*pt, m),
             _ => Sim { s: 1.0, tx: 0.0, ty: 0.0 },
         };
         let meta = serde_json::json!({ "source": "scopecap render", "layer": layer.id, "mag": layer.mag, "states": r.states });
-        let p = r.mosaic.export_with(&ldir, meta)?;
+        let p = export(&r.pieces[..1], &ldir, lv, meta)?;
         println!("   wrote {}×{} px, {} tiles", p.width, p.height, p.tiles);
         view_layers.push((layer.mag, layer.dir.clone(), to_project));
-        done.insert(layer.id, (r.mosaic.snapshot(), to_project));
+        done.insert(layer.id, (Arc::new(r.pieces[0].to_canvas()), to_project));
     }
     if view_layers.is_empty() {
         bail!("project has no recorded sessions");
@@ -200,17 +234,61 @@ fn run_project(dir: &Path, o: &Opts) -> Result<()> {
 }
 
 struct LayerResult {
-    mosaic: Mosaic,
+    /// Composited pieces, largest first (one unless tracking split the
+    /// scan into unconnected pieces).
+    pieces: Vec<Compositor>,
+    /// Mapping onto the parent layer, if registered to one.
+    map: Option<Sim>,
     states: BTreeMap<String, usize>,
 }
 
-/// Flat-field (per settings), then the final pass; writes trace.jsonl and
-/// flat.bin into `out`.
+/// Pieces with fewer frames than this are dropped as strays.
+const MIN_PIECE_FRAMES: usize = 10;
+
+/// One layer: track every frame (positions, confidence), estimate the
+/// flat-field and per-frame gains, then composite with focus weighting.
+/// Writes trace.jsonl and flat.bin into `out`.
 fn render_layer(sessions: &[Session], o: &Opts, out: &Path, make_ref: impl Fn() -> Option<Reference>) -> Result<LayerResult> {
     std::fs::create_dir_all(out)?;
     let s0 = &sessions[0];
     let (w, h) = (s0.info.width as usize, s0.info.height as usize);
     let mut corr = Correction { wb: s0.settings.wb, flat: None, use_flat: true, levels: s0.settings.levels, peaking: false };
+
+    println!("   tracking");
+    let tracked = pass(sessions, &corr, o, w, h, make_ref(), Some(&out.join("trace.jsonl")))?;
+    let total: usize = sessions.iter().map(|s| s.frames.len()).sum();
+    println!("   tracking: {:?}, {} undecodable, {} piece(s)", tracked.states, tracked.decode_fail, tracked.mosaic.islands());
+    if tracked.states.get(&format!("{:?}", Track::Lost)).copied().unwrap_or(0) > total / 4 {
+        println!("   warning: tracking was lost for many frames — parts of the scan may be missing");
+    }
+    // Usable frames, positions resolved through merges: those placed while
+    // still, plus frames taken while moving moderately, which only fill
+    // spots nothing still covers (low weight, unverified position).
+    let merges = tracked.mosaic.merges().to_vec();
+    let mut used: Vec<Used> = tracked
+        .positions
+        .into_iter()
+        .filter_map(|p| {
+            let moving = p.state == Track::TooFast && p.speed > 0.0 && p.speed <= MOVING_MAX * o.max_speed;
+            if p.state != Track::Ok && !moving {
+                return None;
+            }
+            let (root, off) = mosaic::resolve(&merges, p.island);
+            Some(Used {
+                session: p.session,
+                frame: p.frame,
+                group: root,
+                pos: [p.pos[0] + off[0] as f64, p.pos[1] + off[1] as f64],
+                high: p.high && !moving,
+                still: !moving,
+                blocks: if moving { Vec::new() } else { p.blocks.unwrap_or_default() },
+                gain: [1.0; 3],
+            })
+        })
+        .collect();
+    let still: Vec<usize> = (0..used.len()).filter(|&i| used[i].still).collect();
+    println!("   using {} still frames and {} taken while moving (hole filling)", still.len(), used.len() - still.len());
+
     let flat: Option<Flat> = match o.flat {
         FlatMode::None => None,
         FlatMode::Live => {
@@ -221,22 +299,18 @@ fn render_layer(sessions: &[Session], o: &Opts, out: &Path, make_ref: impl Fn() 
             f
         }
         FlatMode::Auto => {
-            // Pass 1 only establishes where every frame is; the flat-field
-            // is then fitted from frame pairs within the same piece.
-            println!("   pass 1/2: tracking");
-            let p1 = pass(sessions, &corr, o, w, h, make_ref(), None)?;
-            let merges = p1.mosaic.merges().to_vec();
-            let good: Vec<(usize, FrameRec, u32, [f64; 2])> = p1
-                .positions
-                .iter()
-                .filter(|p| p.state == Track::Ok && p.pnr >= 30.0)
-                .map(|p| {
-                    let (root, off) = mosaic::resolve(&merges, p.island);
-                    (p.session, p.frame.clone(), root, [p.pos[0] + off[0] as f64, p.pos[1] + off[1] as f64])
-                })
-                .collect();
-            println!("   pass 2/2: rendering");
-            auto_flat(sessions, &good, w, h)
+            let stills: Vec<&Used> = still.iter().map(|&i| &used[i]).collect();
+            let f = auto_flat(&stills, w, h, None);
+            // Frame-to-frame flicker pollutes the flat-field fit; estimate
+            // gains with this first flat, then refit the flat on gain-
+            // corrected frames.
+            match (f, o.gains) {
+                (Some(f), true) => {
+                    let gains = solve_gains(&stills, Some(&f), w, h);
+                    auto_flat(&stills, w, h, Some(&gains)).or(Some(f))
+                }
+                (f, _) => f,
+            }
         }
     };
     corr.flat = flat.map(|mut f| {
@@ -251,14 +325,103 @@ fn render_layer(sessions: &[Session], o: &Opts, out: &Path, make_ref: impl Fn() 
             println!("   installed as the live flat-field calibration ({})", config::config_dir().join("flat.bin").display());
         }
     }
-    let r = pass(sessions, &corr, o, w, h, make_ref(), Some(&out.join("trace.jsonl")))?;
-    let total: usize = sessions.iter().map(|s| s.frames.len()).sum();
-    println!("   tracking: {:?}, {} undecodable, {} piece(s)", r.states, r.decode_fail, r.mosaic.islands());
-    if r.states.get(&format!("{:?}", Track::Lost)).copied().unwrap_or(0) > total / 4 {
-        println!("   warning: tracking was lost for many frames — parts of the scan may be missing");
+
+    if o.gains {
+        let t0 = Instant::now();
+        let stills: Vec<&Used> = still.iter().map(|&i| &used[i]).collect();
+        let gains = solve_gains(&stills, corr.flat.as_deref(), w, h);
+        let spread = gains.iter().map(|g| g[1]).fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(v), b.max(v)));
+        println!(
+            "   per-frame light correction for {} frames: gains {:.2}–{:.2} ({:.1}s)",
+            gains.len(),
+            spread.0,
+            spread.1,
+            t0.elapsed().as_secs_f32()
+        );
+        for (&i, g) in still.iter().zip(gains) {
+            used[i].gain = g;
+        }
     }
-    Ok(LayerResult { mosaic: r.mosaic, states: r.states })
+
+    // Group into pieces; drop strays.
+    let mut groups: HashMap<u32, usize> = HashMap::new();
+    for u in &used {
+        *groups.entry(u.group).or_default() += 1;
+    }
+    let mut order: Vec<(u32, usize)> = groups.into_iter().filter(|g| g.1 >= MIN_PIECE_FRAMES).collect();
+    order.sort_by_key(|g| std::cmp::Reverse(g.1));
+    let index: HashMap<u32, usize> = order.iter().enumerate().map(|(i, g)| (g.0, i)).collect();
+    let mut pieces: Vec<Compositor> = order.iter().map(|_| Compositor::new()).collect();
+    if pieces.is_empty() {
+        bail!("no usable frames");
+    }
+
+    for focus in [true, false] {
+        println!("   compositing: {}", if focus { "focus map" } else { "blending" });
+        let t0 = Instant::now();
+        let mut done = 0usize;
+        for (si, sess) in sessions.iter().enumerate() {
+            let mine: Vec<&Used> = used.iter().filter(|u| u.session == si && index.contains_key(&u.group)).collect();
+            for chunk in mine.chunks(64) {
+                let recs: Vec<FrameRec> = chunk.iter().map(|u| u.frame.clone()).collect();
+                let placed: Vec<(usize, Placed)> = decode_batch(&sess.stream, &recs, w, h)
+                    .into_par_iter()
+                    .zip(chunk.par_iter())
+                    .filter_map(|(img, u)| {
+                        let mut img = img?;
+                        proc::apply_correction(&mut img, &corr);
+                        for p in img.data.chunks_mut(3) {
+                            for c in 0..3 {
+                                p[c] /= u.gain[c];
+                            }
+                        }
+                        let weight = if u.still { 1.0 } else { MOVING_WEIGHT };
+                        Some((index[&u.group], Placed::new(img, u.pos, u.high, weight)))
+                    })
+                    .collect();
+                for (gi, piece) in pieces.iter_mut().enumerate() {
+                    // Moving frames don't define the best focus.
+                    let refs: Vec<&Placed> =
+                        placed.iter().filter(|p| p.0 == gi && (!focus || p.1.weight >= 1.0)).map(|p| &p.1).collect();
+                    if refs.is_empty() {
+                        continue;
+                    }
+                    if focus {
+                        piece.add_focus(&refs);
+                    } else {
+                        piece.accumulate(&refs);
+                    }
+                }
+                done += chunk.len();
+            }
+        }
+        if focus {
+            for p in &mut pieces {
+                p.end_focus_pass();
+            }
+        }
+        println!("     {} frames in {:.1}s", done, t0.elapsed().as_secs_f32());
+    }
+    Ok(LayerResult { pieces, map: tracked.mosaic.layer_map(), states: tracked.states })
 }
+
+/// A frame chosen for compositing.
+struct Used {
+    session: usize,
+    frame: FrameRec,
+    group: u32,
+    pos: [f64; 2],
+    high: bool,
+    /// Taken while still (false: moving, used only to fill holes).
+    still: bool,
+    blocks: Vec<f32>,
+    gain: [f32; 3],
+}
+
+/// Frames moving up to this multiple of the speed limit fill holes.
+const MOVING_MAX: f32 = 4.0;
+/// Their weight relative to still frames.
+const MOVING_WEIGHT: f32 = 0.05;
 
 struct FramePos {
     session: usize,
@@ -266,7 +429,11 @@ struct FramePos {
     island: u32,
     pos: [f64; 2],
     state: Track,
-    pnr: f32,
+    high: bool,
+    speed: f32,
+    /// Block means (FLAT grid) of frames that were placed, for the
+    /// flat-field and gain estimation.
+    blocks: Option<Vec<f32>>,
 }
 
 struct PassResult {
@@ -276,7 +443,7 @@ struct PassResult {
     decode_fail: usize,
 }
 
-/// Run every frame of every session through the mosaic engine in order.
+/// Run every frame of every session through the tracking engine in order.
 fn pass(
     sessions: &[Session],
     corr: &Correction,
@@ -323,14 +490,24 @@ fn pass(
                 for e in &events {
                     println!("     frame {}: {e}", fr.seq);
                 }
-                positions.push(FramePos { session: si, frame: fr.clone(), island: m.island_id(), pos: m.pos, state: m.track, pnr });
+                let placed = m.track == Track::Ok && !touched.is_empty();
+                positions.push(FramePos {
+                    session: si,
+                    frame: fr.clone(),
+                    island: m.island_id(),
+                    pos: m.pos,
+                    state: if placed { Track::Ok } else { m.track },
+                    high: m.last_conf() == mosaic::CONF_HIGH,
+                    speed,
+                    blocks: placed.then(|| proc::block_means(&img, proc::FLAT_W, proc::FLAT_H)),
+                });
                 if let Some(t) = &mut trace {
                     writeln!(
                         t,
                         "{}",
                         serde_json::json!({
                             "session": si, "seq": fr.seq, "state": format!("{:?}", m.track), "x": m.pos[0], "y": m.pos[1],
-                            "island": m.island_id(), "pnr": pnr, "speed": speed, "pasted": !touched.is_empty(),
+                            "island": m.island_id(), "pnr": pnr, "speed": speed, "pasted": placed,
                             "pieces": m.islands(), "events": events,
                         })
                     )?;
@@ -346,27 +523,48 @@ fn pass(
     Ok(PassResult { mosaic, positions, states, decode_fail })
 }
 
-/// Estimate the flat-field from well-registered frames, given as
-/// (session index, frame, piece id, position in that piece).
-fn auto_flat(sessions: &[Session], good: &[(usize, FrameRec, u32, [f64; 2])], w: usize, h: usize) -> Option<Flat> {
-    // Thin to at most ~800 frames spread over the whole scan.
-    let step = (good.len() / 800).max(1);
-    let pick: Vec<_> = good.iter().step_by(step).collect();
-    if pick.len() < 20 {
-        println!("   auto flat-field: only {} well-tracked frames, not enough; rendering without one", pick.len());
+/// Per-frame gains from the placed frames' (flat-corrected) block means.
+fn solve_gains(used: &[&Used], flat: Option<&Flat>, w: usize, h: usize) -> Vec<[f32; 3]> {
+    let samples: Vec<autoflat::Sample> = used
+        .par_iter()
+        .map(|u| {
+            let mut blocks = u.blocks.clone();
+            if let Some(f) = flat {
+                for (v, g) in blocks.iter_mut().zip(&f.small) {
+                    *v /= g;
+                }
+            }
+            autoflat::Sample { group: u.group, pos: u.pos, blocks }
+        })
+        .collect();
+    autoflat::frame_gains(&samples, w, h)
+}
+
+/// Estimate the flat-field from the placed frames' block means, optionally
+/// with per-frame gains (indexed like `used`) divided out first.
+fn auto_flat(used: &[&Used], w: usize, h: usize, gains: Option<&[[f32; 3]]>) -> Option<Flat> {
+    // At most ~800 frames spread over the whole scan.
+    let step = (used.len() / 800).max(1);
+    let samples: Vec<autoflat::Sample> = used
+        .iter()
+        .enumerate()
+        .step_by(step)
+        .filter(|(_, u)| !u.blocks.is_empty())
+        .map(|(i, u)| {
+            let mut blocks = u.blocks.clone();
+            if let Some(g) = gains {
+                for (j, v) in blocks.iter_mut().enumerate() {
+                    *v /= g[i][j % 3];
+                }
+            }
+            autoflat::Sample { group: u.group, pos: u.pos, blocks }
+        })
+        .collect();
+    if samples.len() < 20 {
+        println!("   auto flat-field: only {} placed frames, not enough; rendering without one", samples.len());
         return None;
     }
     let t0 = Instant::now();
-    let mut samples = Vec::new();
-    for (si, sess) in sessions.iter().enumerate() {
-        let mine: Vec<_> = pick.iter().filter(|p| p.0 == si).collect();
-        let recs: Vec<FrameRec> = mine.iter().map(|p| p.1.clone()).collect();
-        for (img, p) in decode_batch(&sess.stream, &recs, w, h).into_iter().zip(&mine) {
-            if let Some(img) = img {
-                samples.push(autoflat::Sample { group: p.2, pos: p.3, blocks: proc::block_means(&img, proc::FLAT_W, proc::FLAT_H) });
-            }
-        }
-    }
     match autoflat::estimate(&samples, w, h) {
         Some(e) => {
             println!(

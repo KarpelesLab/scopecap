@@ -8,6 +8,7 @@
 //! gives the flat-field without needing a blank calibration target.
 
 use crate::proc::{Flat, FLAT_H, FLAT_W};
+use rayon::prelude::*;
 
 /// One registered frame: canvas position and FLAT_W×FLAT_H block means.
 pub struct Sample {
@@ -248,4 +249,148 @@ mod tests {
             assert!((got / want - 1.0).abs() < tol, "({bx},{by}) got {got} want {want} rms {}", e.rms);
         }
     }
+}
+
+/// Per-frame brightness/colour gains from overlapping frames.
+///
+/// For each pair of overlapping frames, the median log ratio of their
+/// flat-corrected block means over the shared area is the difference of
+/// their (log) gains: lamp flicker, exposure drift, changing illumination.
+/// The gains are the least-squares solution over all pairs (conjugate
+/// gradient on the graph Laplacian). The regularisation towards 1 is
+/// strong enough to stop small per-pair biases (residual vignetting,
+/// relief) from accumulating into drift along long scan paths, while
+/// frame-to-frame flicker is still corrected.
+/// `samples[i].blocks` must already be flat-corrected. Returns, per frame,
+/// the factor to divide that frame by.
+pub fn frame_gains(samples: &[Sample], w: usize, h: usize) -> Vec<[f32; 3]> {
+    let n = samples.len();
+    let (fw, fh) = (FLAT_W, FLAT_H);
+    let (cw, ch) = (w as f64 / fw as f64, h as f64 / fh as f64);
+    // Neighbours via a grid of frame-sized cells.
+    let mut grid: std::collections::HashMap<(i64, i64), Vec<usize>> = std::collections::HashMap::new();
+    let cell = |p: [f64; 2]| ((p[0] / w as f64).floor() as i64, (p[1] / h as f64).floor() as i64);
+    for (i, s) in samples.iter().enumerate() {
+        grid.entry(cell(s.pos)).or_default().push(i);
+    }
+    let pairs: Vec<(usize, usize)> = (0..n)
+        .into_par_iter()
+        .flat_map_iter(|i| {
+            let (cx, cy) = cell(samples[i].pos);
+            let mut near: Vec<(f64, usize)> = Vec::new();
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    for &j in grid.get(&(cx + dx, cy + dy)).map(|v| v.as_slice()).unwrap_or(&[]) {
+                        if j <= i || samples[j].group != samples[i].group {
+                            continue;
+                        }
+                        let (ddx, ddy) = (samples[j].pos[0] - samples[i].pos[0], samples[j].pos[1] - samples[i].pos[1]);
+                        if ddx.abs() < 0.75 * w as f64 && ddy.abs() < 0.75 * h as f64 {
+                            near.push((ddx * ddx + ddy * ddy, j));
+                        }
+                    }
+                }
+            }
+            // Spread the comparisons: a few nearest plus a few farther ones.
+            near.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            let picks: Vec<usize> = near.iter().step_by((near.len() / 10).max(1)).take(10).map(|x| x.1).collect();
+            picks.into_iter().map(move |j| (i, j))
+        })
+        .collect();
+    // Median log ratio per channel for each pair.
+    let edges: Vec<(usize, usize, [f64; 3])> = pairs
+        .par_iter()
+        .filter_map(|&(i, j)| {
+            let (a, b) = (&samples[i], &samples[j]);
+            let (ox, oy) = (a.pos[0] - b.pos[0], a.pos[1] - b.pos[1]);
+            let mut r: [Vec<f64>; 3] = Default::default();
+            for by in 1..fh - 1 {
+                for bx in 1..fw - 1 {
+                    let at = |x: usize, y: usize, c: usize| a.blocks[(y * fw + x) * 3 + c];
+                    let (u, v) = (((bx as f64 + 0.5) * cw + ox) / cw - 0.5, ((by as f64 + 0.5) * ch + oy) / ch - 0.5);
+                    if u < 1.0 || v < 1.0 || u > (fw - 2) as f64 || v > (fh - 2) as f64 {
+                        continue;
+                    }
+                    // Flat-ish blocks only: misregistration barely matters there.
+                    let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+                    for (dx, dy) in [(0, 1), (2, 1), (1, 0), (1, 2), (1, 1)] {
+                        let v = at(bx + dx - 1, by + dy - 1, 1);
+                        lo = lo.min(v);
+                        hi = hi.max(v);
+                    }
+                    if lo < 0.02 || hi / lo > 1.15 {
+                        continue;
+                    }
+                    let (u0, v0) = (u as usize, v as usize);
+                    let (tu, tv) = ((u - u0 as f64) as f32, (v - v0 as f64) as f32);
+                    for c in 0..3 {
+                        let s = |x: usize, y: usize| b.blocks[(y * fw + x) * 3 + c];
+                        let vb = (s(u0, v0) * (1.0 - tu) + s(u0 + 1, v0) * tu) * (1.0 - tv)
+                            + (s(u0, v0 + 1) * (1.0 - tu) + s(u0 + 1, v0 + 1) * tu) * tv;
+                        let va = at(bx, by, c);
+                        if va > 0.005 && vb > 0.005 {
+                            r[c].push((va as f64 / vb as f64).ln());
+                        }
+                    }
+                }
+            }
+            if r[1].len() < 40 {
+                return None;
+            }
+            let mut d = [0.0; 3];
+            for c in 0..3 {
+                if r[c].len() < 40 {
+                    return None;
+                }
+                r[c].sort_by(|x, y| x.partial_cmp(y).unwrap());
+                d[c] = r[c][r[c].len() / 2];
+                // Implausible for lamp flicker or exposure drift.
+                if d[c].abs() > 0.35 {
+                    return None;
+                }
+            }
+            Some((i, j, d))
+        })
+        .collect();
+    let mut adj: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n]; // (neighbour, edge index)
+    for (e, &(i, j, _)) in edges.iter().enumerate() {
+        adj[i].push((j, e));
+        adj[j].push((i, e));
+    }
+    const LAMBDA: f64 = 0.2;
+    let mut gains = vec![[1.0f32; 3]; n];
+    for c in 0..3 {
+        // (deg_i + λ) x_i − Σ_j x_j = Σ_j d_ij  (d_ji = −d_ij)
+        let b: Vec<f64> = (0..n)
+            .map(|i| adj[i].iter().map(|&(_, e)| if edges[e].0 == i { edges[e].2[c] } else { -edges[e].2[c] }).sum())
+            .collect();
+        let apply = |x: &[f64]| -> Vec<f64> {
+            (0..n).map(|i| (adj[i].len() as f64 + LAMBDA) * x[i] - adj[i].iter().map(|&(j, _)| x[j]).sum::<f64>()).collect()
+        };
+        let mut x = vec![0.0; n];
+        let mut r = b.clone();
+        let mut p = r.clone();
+        let mut rr: f64 = r.iter().map(|v| v * v).sum();
+        for _ in 0..1000 {
+            if rr < 1e-12 * n as f64 {
+                break;
+            }
+            let ap = apply(&p);
+            let alpha = rr / p.iter().zip(&ap).map(|(a, b)| a * b).sum::<f64>().max(1e-30);
+            for i in 0..n {
+                x[i] += alpha * p[i];
+                r[i] -= alpha * ap[i];
+            }
+            let rr2: f64 = r.iter().map(|v| v * v).sum();
+            let beta = rr2 / rr;
+            rr = rr2;
+            for i in 0..n {
+                p[i] = r[i] + beta * p[i];
+            }
+        }
+        for i in 0..n {
+            gains[i][c] = (x[i].exp() as f32).clamp(0.7, 1.4);
+        }
+    }
+    gains
 }

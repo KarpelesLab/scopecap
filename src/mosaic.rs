@@ -32,9 +32,9 @@ pub const PT: usize = T / PREV;
 pub const LOW: usize = 8;
 const LT: usize = T / LOW;
 /// u16 canvas storage covers linear values 0..RANGE (WB gains can push >1).
-const RANGE: f32 = 4.0;
+pub const RANGE: f32 = 4.0;
 /// Coarse tracking runs at 1/SMALL resolution.
-const SMALL: usize = 4;
+pub const SMALL: usize = 4;
 /// Precise frame-to-canvas alignment uses the whole frame at 1/FINE resolution.
 const FINE: usize = 2;
 /// Minimum correlation peak-to-noise ratios (unrelated images score ≈ 8–9).
@@ -44,11 +44,13 @@ const RELOC_MIN_PNR: f32 = 16.0;
 const GLOBAL_MIN_PNR: f32 = 20.0;
 const LOWPASS: f32 = 0.15;
 /// Frame border (px) never pasted: worst vignetting, JPEG edge blocks.
-const MARGIN: f32 = 8.0;
+pub const MARGIN: f32 = 8.0;
 /// Width of the edge ramp over which a frame's sharpness weight fades in.
 const EDGE_RAMP: f32 = 160.0;
 /// While tracking with other islands around, search them every N frames.
 const SEARCH_EVERY: u32 = 8;
+/// Consecutive still frames required before pasting resumes after motion.
+const SETTLE_FRAMES: u32 = 2;
 /// Consecutive lost frames with a clear view before a new island is started.
 const NEW_ISLAND_AFTER: u32 = 10;
 /// Relocations must agree with the canvas pixel-wise (normalised
@@ -75,7 +77,7 @@ pub const CONF_LOW: u8 = 0;
 pub const CONF_HIGH: u8 = 1;
 /// Exported/previewed alpha of low-confidence pixels: flags them visually
 /// and lets the layer below show through.
-const LOW_CONF_ALPHA: u8 = 170;
+pub const LOW_CONF_ALPHA: u8 = 170;
 
 impl Tile {
     fn new() -> Self {
@@ -153,6 +155,42 @@ impl Canvas {
             c.tiles.insert(k, t);
         }
         c
+    }
+
+    /// Build from composited tiles: linear RGB (T×T×3), covered and
+    /// high-confidence masks.
+    pub fn from_linear_tiles(tiles: Vec<((i32, i32), Vec<f32>, Vec<bool>, Vec<bool>)>) -> Canvas {
+        let mut c = Canvas::default();
+        for (k, rgb, covered, high) in tiles {
+            let mut t = Tile::new();
+            for i in 0..T * T {
+                if !covered[i] {
+                    continue;
+                }
+                for ch in 0..3 {
+                    t.rgb[i * 3 + ch] = (rgb[i * 3 + ch].clamp(0.0, RANGE) / RANGE * 65535.0) as u16;
+                }
+                t.sharp[i] = 0.0;
+                t.conf[i] = if high[i] { CONF_HIGH } else { CONF_LOW };
+            }
+            t.update_low();
+            let (x, y) = (k.0 as f32 * T as f32, k.1 as f32 * T as f32);
+            c.bounds = Some(union(c.bounds, [x, y, x + T as f32, y + T as f32]));
+            c.tiles.insert(k, t);
+        }
+        c
+    }
+
+    /// Linear RGB at a pixel, if covered.
+    pub fn rgb_at(&self, x: i64, y: i64) -> Option<[f32; 3]> {
+        let k = tile_key(x, y);
+        let t = self.tiles.get(&k)?;
+        let i = (y - k.1 as i64 * T as i64) as usize * T + (x - k.0 as i64 * T as i64) as usize;
+        if t.sharp[i] < 0.0 {
+            return None;
+        }
+        let p = &t.rgb[i * 3..i * 3 + 3];
+        Some([p[0] as f32 * (RANGE / 65535.0), p[1] as f32 * (RANGE / 65535.0), p[2] as f32 * (RANGE / 65535.0)])
     }
 
     /// Green channel at full resolution; NaN where empty.
@@ -346,8 +384,6 @@ pub struct LayerSpec {
     /// Directory name, used for export.
     pub dir: String,
     pub parent: Option<u32>,
-    /// Mapping onto the parent from an earlier session, if known.
-    pub map: Option<Sim>,
 }
 
 pub enum Msg {
@@ -406,6 +442,9 @@ pub struct Mosaic {
     /// reference position (None after a relocation).
     track_acc: [f64; 2],
     ref_last: Option<[f64; 2]>,
+    /// Consecutive frames below the speed limit.
+    still_run: u32,
+    last_conf: u8,
 }
 
 struct LayerRt {
@@ -417,7 +456,7 @@ struct LayerRt {
 /// instead of building up latency when this thread falls behind.
 pub fn run(rx: Receiver<Msg>, shared: Arc<Mutex<Shared>>, pending: Arc<AtomicUsize>, repaint: impl Fn()) {
     let default_layer = || LayerRt {
-        spec: LayerSpec { id: 0, mag: 0.0, dir: ".".into(), parent: None, map: None },
+        spec: LayerSpec { id: 0, mag: 0.0, dir: ".".into(), parent: None },
         m: Mosaic::new(Levels::default(), 2.0),
     };
     let mut layers = vec![default_layer()];
@@ -530,7 +569,10 @@ pub fn run(rx: Receiver<Msg>, shared: Arc<Mutex<Shared>>, pending: Arc<AtomicUsi
                                     p.m.snapshot(),
                                     (p.spec.mag / spec.mag) as f64,
                                     hint,
-                                    spec.map,
+                                    // A layer's coordinates start at its first placed
+                                    // frame, so a mapping from another run doesn't
+                                    // apply: always measure it.
+                                    None,
                                 ));
                             }
                         }
@@ -613,7 +655,7 @@ fn export_layers(layers: &[LayerRt], dir: &Path, name: &str) -> Result<usize> {
     Ok(with.len())
 }
 
-fn green(f: &Lin) -> Vec<f32> {
+pub fn green(f: &Lin) -> Vec<f32> {
     f.data.par_chunks(3).map(|p| p[1]).collect()
 }
 
@@ -677,6 +719,8 @@ impl Mosaic {
             calib_wait: 0,
             track_acc: [0.0; 2],
             ref_last: None,
+            still_run: 0,
+            last_conf: CONF_HIGH,
         }
     }
 
@@ -691,6 +735,11 @@ impl Mosaic {
     pub fn snapshot(&self) -> Arc<Canvas> {
         let main = std::iter::once(&self.canvas).chain(&self.others).max_by_key(|c| c.tiles.len()).unwrap();
         Arc::new(main.clone())
+    }
+
+    /// Confidence the last pasted frame was placed with.
+    pub fn last_conf(&self) -> u8 {
+        self.last_conf
     }
 
     /// Mapping of this layer onto the reference layer, once calibrated.
@@ -910,10 +959,16 @@ impl Mosaic {
         self.pos = pos;
         if self.track == Track::Lost {
             // Just relocated: the speed estimate is meaningless this frame.
+            self.still_run = 0;
             self.track = Track::TooFast;
             return (Vec::new(), peak, 0.0);
         }
-        if speed > self.max_speed {
+        // Paste only once the image has stayed still for a few frames: right
+        // after a nudge (or a jolt from touching the stage knob) frames can be
+        // slow for an instant while still wobbling, skewed by the rolling
+        // shutter.
+        self.still_run = if speed > self.max_speed { 0 } else { self.still_run + 1 };
+        if self.still_run <= SETTLE_FRAMES {
             self.track = Track::TooFast;
             return (Vec::new(), peak, speed);
         }
@@ -927,6 +982,7 @@ impl Mosaic {
             }
         }
         self.track = Track::Ok;
+        self.last_conf = conf;
         (self.paste(f, &g, conf), peak, speed)
     }
 
@@ -1046,7 +1102,7 @@ impl Mosaic {
     /// Per-cell sharpness at 1/SMALL resolution: smoothed squared Laplacian
     /// of green, faded towards the frame edges.
     /// Also returns the frame's median (unweighted) sharpness.
-    fn sharpness(g: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, usize, f32) {
+    pub fn sharpness(g: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, usize, f32) {
         let (sw, sh) = (w / SMALL, h / SMALL);
         let mut s = vec![0.0f32; sw * sh];
         s.par_chunks_mut(sw).enumerate().for_each(|(sy, line)| {
@@ -1265,7 +1321,7 @@ fn verify(canvas: &Canvas, small: &[f32], w: usize, h: usize, pos: [f64; 2]) -> 
     sab / (saa * sbb).sqrt().max(1e-12) >= VERIFY_MIN_NCC
 }
 
-fn bilinear1(v: &[f32], w: usize, h: usize, x: f32, y: f32) -> f32 {
+pub fn bilinear1(v: &[f32], w: usize, h: usize, x: f32, y: f32) -> f32 {
     let (x0, y0) = (x as usize, y as usize);
     let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
     let (tx, ty) = (x - x0 as f32, y - y0 as f32);

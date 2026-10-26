@@ -3,6 +3,8 @@
 //! image, with a known vignette and colour falloff, MJPEG-encoded.
 //! usage: simsession <big.png> <out-dir> [serpentine|islands|lowmag] [scale]
 //! `scale` < 1 simulates a lower magnification: frame px = scale × image px.
+//! SIM_FX=1: per-frame brightness flicker (±15%) and focus sweeps (five
+//! frames per stop sweeping through focus, the sharp one at varying points).
 #[path = "../src/proc.rs"]
 mod proc;
 #[path = "../src/recorder.rs"]
@@ -22,6 +24,35 @@ fn main() -> anyhow::Result<()> {
     let src = img.to_rgb8();
     let (bw, bh, bpp) = (img.width as usize, img.height as usize, 3);
     let (w, h) = (1920usize, 1080usize);
+    // Linear source image, plus box-blurred copies for defocused frames.
+    let base: Vec<f32> = (0..bw * bh * 3).map(|i| proc::srgb_to_lin(src[(i / 3) * bpp + i % 3] as f32 / 255.0)).collect();
+    let boxblur = |img: &[f32], r: usize| -> Vec<f32> {
+        let mut tmp = vec![0.0f32; img.len()];
+        for y in 0..bh {
+            for x in 0..bw {
+                let (a, b) = (x.saturating_sub(r), (x + r).min(bw - 1));
+                for c in 0..3 {
+                    tmp[(y * bw + x) * 3 + c] = (a..=b).map(|xx| img[(y * bw + xx) * 3 + c]).sum::<f32>() / (b - a + 1) as f32;
+                }
+            }
+        }
+        let mut out = vec![0.0f32; img.len()];
+        for y in 0..bh {
+            let (a, b) = (y.saturating_sub(r), (y + r).min(bh - 1));
+            for x in 0..bw {
+                for c in 0..3 {
+                    out[(y * bw + x) * 3 + c] = (a..=b).map(|yy| tmp[(yy * bw + x) * 3 + c]).sum::<f32>() / (b - a + 1) as f32;
+                }
+            }
+        }
+        out
+    };
+    let mut levels_lin: Vec<Vec<f32>> = vec![Vec::new(); 6];
+    levels_lin[0] = base.clone();
+    if std::env::var_os("SIM_FX").is_some() {
+        levels_lin[2] = boxblur(&base, 2);
+        levels_lin[5] = boxblur(&base, 5);
+    }
     let vig = |x: f64, y: f64, c: usize| {
         let (u, v) = (2.0 * x / w as f64 - 1.0, 2.0 * y / h as f64 - 1.0);
         let r2 = u * u + v * v;
@@ -29,6 +60,12 @@ fn main() -> anyhow::Result<()> {
         1.0 - [0.30, 0.25, 0.40][c] * r2 + 0.04 * u
     };
     let mode = args.get(3).map(String::as_str).unwrap_or("serpentine");
+    let fx = std::env::var_os("SIM_FX").is_some();
+    let mut seed = 777u32;
+    let mut rnd = move || {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        (seed >> 8) as f32 / (1 << 24) as f32
+    };
     let scale: f64 = args.get(4).map(|v| v.parse().unwrap()).unwrap_or(1.0);
     let mut path = Vec::new();
     if mode == "lowmag" {
@@ -64,9 +101,10 @@ fn main() -> anyhow::Result<()> {
         let y = 50.0 + row as f64 * 700.0;
         let xs: Vec<f64> = (0..=2700).step_by(1).map(|x| x as f64).collect();
         let xs: Vec<f64> = if row % 2 == 0 { xs } else { xs.into_iter().rev().collect() };
+        let per_stop = if fx { 5 } else { 2 };
         for x in xs.into_iter().step_by(15) {
             // a few still frames at each stop
-            for _ in 0..2 { path.push((x + 50.0, y)); }
+            for _ in 0..per_stop { path.push((x + 50.0, y)); }
         }
     }
     let info = recorder::SessionInfo {
@@ -84,6 +122,9 @@ fn main() -> anyhow::Result<()> {
     for (i, &(px, py)) in path.iter().enumerate() {
         let (mut yp, mut cb, mut cr) = (vec![0u8; w * h], vec![0u8; w / 2 * h], vec![0u8; w / 2 * h]);
         let k = (1.0 / scale).ceil() as usize;
+        let gain = if fx { 0.85 + 0.3 * rnd() } else { 1.0 };
+        // Focus sweeps through each stop; where the sharp frame falls varies.
+        let blur = if fx { [5usize, 2, 0, 2, 5][(i % 5 + i / 5) % 5] } else { 0 };
         for y in 0..h {
             for x in 0..w {
                 let mut rgb = [0.0f32; 3];
@@ -93,10 +134,10 @@ fn main() -> anyhow::Result<()> {
                         for i in 0..k {
                             let sx = (px + (x as f64 + (i as f64 + 0.5) / k as f64) / scale) as usize;
                             let sy = (py + (y as f64 + (j as f64 + 0.5) / k as f64) / scale) as usize;
-                            lin += proc::srgb_to_lin(src[(sy.min(bh - 1) * bw + sx.min(bw - 1)) * bpp + c] as f32 / 255.0);
+                            lin += levels_lin[blur][(sy.min(bh - 1) * bw + sx.min(bw - 1)) * 3 + c];
                         }
                     }
-                    lin = lin / (k * k) as f32 * vig(x as f64, y as f64, c) as f32;
+                    lin = lin / (k * k) as f32 * vig(x as f64, y as f64, c) as f32 * gain;
                     rgb[c] = proc::lin_to_srgb(lin) * 255.0;
                 }
                 let yy = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2];

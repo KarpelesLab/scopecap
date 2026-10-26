@@ -31,7 +31,7 @@ fn main() -> anyhow::Result<()> {
         let (mag, dir) = a.split_once(':').unwrap();
         let mag: f32 = mag.parse()?;
         let id = i as u32 + 1;
-        tx.send(mosaic::Msg::Layer(mosaic::LayerSpec { id, mag, dir: format!("L{id}"), parent, map: None }))?;
+        tx.send(mosaic::Msg::Layer(mosaic::LayerSpec { id, mag, dir: format!("L{id}"), parent }))?;
         tx.send(mosaic::Msg::Start { levels: proc::Levels { lo: 0.0, hi: 1.0 }, rec: None })?;
         let frames: Vec<recorder::FrameRec> = recorder::read_jsonl(&std::path::Path::new(dir).join("frames.jsonl"))?;
         let stream = std::fs::read(std::path::Path::new(dir).join("stream.mjpeg"))?;

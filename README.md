@@ -28,9 +28,16 @@ the mosaic can be rebuilt offline with better processing.
   kept but flagged (shown semi-transparent).
 - **Recording**: every raw frame is saved (`stream.mjpeg`) with timing and
   tracking logs, so nothing is lost and scans can be reprocessed.
-- **Offline rendering** (`scopecap render`): reprocesses recordings using
-  every frame, with a flat-field (vignetting/illumination) correction
-  estimated from the scan itself — no calibration target needed.
+- **Offline rendering** (`scopecap render`): the finished image, built from
+  every recorded frame:
+  - flat-field (vignetting/illumination) estimated from the scan itself — no
+    calibration target needed;
+  - per-frame brightness/colour correction (lamp flicker, exposure drift)
+    solved jointly over all overlapping frames;
+  - focus-aware blending: where focus was swept, the sharpest frames win
+    and near-equal ones are averaged, whatever the order they came in;
+  - each magnification colour-matched to the one below, one set of levels
+    for the whole project, seams feathered, stray fragments dropped.
 - **Export as a tile pyramid** (PNG) with a self-contained `index.html`
   viewer: pan/zoom like a map, only visible tiles load, works straight from
   disk. Multi-layer projects stack all magnifications with per-layer toggles.
@@ -55,6 +62,10 @@ cargo run --release
 The camera defaults to `/dev/video0` at 1920×1080 MJPEG. Settings are kept
 in `~/.config/scopecap/settings.json` and captures/projects go to
 `~/Pictures/scopecap/` (configurable in the app).
+
+At high magnification touching the stage knob makes the image jump: nudge,
+let go, and let it settle — frames are only added once the image has been
+still for a few frames, and the lower layer puts the view back in place.
 
 Before scanning:
 
@@ -82,13 +93,14 @@ once the image is stable), <kbd>Esc</kbd> cancels.
 ### Offline rendering
 
 ```sh
-scopecap render <project-or-scan-dir> [--flat auto|live|none] [--max-speed PX] [--out DIR] [--install-flat] [--no-join]
+scopecap render <project-or-scan-dir> [--flat auto|live|none] [--max-speed PX] [--out DIR] [--install-flat] [--no-gains] [--no-join]
 ```
 
 - `--flat auto` (default) estimates the flat-field from the recording,
   `live` uses the one active while scanning, `none` disables it.
 - `--install-flat` also makes the estimated flat-field the live app's
   calibration.
+- `--no-gains` skips the per-frame brightness/colour correction.
 - Output goes to `render-<timestamp>/` inside the input directory, including
   `trace.jsonl` (per-frame tracking decisions) for debugging.
 
@@ -118,8 +130,13 @@ project-<ts>/
   and matched against the frozen lower layer (coarse-to-fine, from per-tile
   thumbnails when searching a whole layer). The mapping is a similarity
   without rotation, `q = s·p + t`.
-- **Compositing**: per-pixel sharpness (smoothed Laplacian energy, faded at
-  frame edges) decides which frame wins; similar sharpness blends.
+- **Compositing**: live, each pixel keeps the sharpest version seen so far.
+  Offline, a first pass records the best sharpness reached at every spot,
+  and a second blends frames with weight (sharpness / best)⁸, feathered at
+  frame edges.
+- **Light**: per-frame gains are the least-squares solution of the median
+  brightness ratios between overlapping frames; the flat-field and the
+  gains are estimated alternately.
 - **Flat-field**: the same spot seen at different positions in different
   frames gives the illumination ratio between those positions; a smooth
   polynomial fitted to many such pairs is the flat-field.

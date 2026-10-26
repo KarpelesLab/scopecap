@@ -595,7 +595,6 @@ impl App {
             mag: layer.mag,
             dir: layer.dir.clone(),
             parent: layer.parent,
-            map: layer.map,
         }));
         // The scan view needs fixed levels so all parts look alike; leave
         // headroom for brighter areas than the current view. (Exports
