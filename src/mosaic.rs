@@ -65,11 +65,26 @@ struct Tile {
     sharp: Vec<f32>,
     /// LT×LT mean green, NaN where (mostly) empty.
     low: Vec<f32>,
+    /// Per-pixel confidence in the position it was pasted at: HIGH when
+    /// verified against the layer below (or no layer below exists), LOW
+    /// when placed by tracking alone. Higher confidence always overwrites.
+    conf: Vec<u8>,
 }
+
+pub const CONF_LOW: u8 = 0;
+pub const CONF_HIGH: u8 = 1;
+/// Exported/previewed alpha of low-confidence pixels: flags them visually
+/// and lets the layer below show through.
+const LOW_CONF_ALPHA: u8 = 170;
 
 impl Tile {
     fn new() -> Self {
-        Tile { rgb: vec![0; T * T * 3], sharp: vec![-1.0; T * T], low: vec![f32::NAN; LT * LT] }
+        Tile {
+            rgb: vec![0; T * T * 3],
+            sharp: vec![-1.0; T * T],
+            low: vec![f32::NAN; LT * LT],
+            conf: vec![CONF_LOW; T * T],
+        }
     }
 
     fn update_low(&mut self) {
@@ -130,6 +145,7 @@ impl Canvas {
                     t.rgb[i * 3 + ch] = (lin / RANGE * 65535.0) as u16;
                 }
                 t.sharp[i] = 0.0;
+                t.conf[i] = if rgba[i * 4 + 3] == 255 { CONF_HIGH } else { CONF_LOW };
             }
             t.update_low();
             let (x, y) = (k.0 as f32 * T as f32, k.1 as f32 * T as f32);
@@ -229,8 +245,11 @@ impl Canvas {
                         let si0 = (sy - sk.1 as i64 * T as i64) as usize * T + (sx - sk.0 as i64 * T as i64) as usize;
                         for n in 0..seg {
                             let (si, di) = (si0 + n, dy * T + dx + n);
-                            if s.sharp[si] >= 0.0 && s.sharp[si] > dst.sharp[di] {
+                            let better = s.conf[si] > dst.conf[di]
+                                || (s.conf[si] == dst.conf[di] && s.sharp[si] > dst.sharp[di]);
+                            if s.sharp[si] >= 0.0 && (dst.sharp[di] < 0.0 || better) {
                                 dst.sharp[di] = s.sharp[si];
+                                dst.conf[di] = s.conf[si];
                                 dst.rgb[di * 3..di * 3 + 3].copy_from_slice(&s.rgb[si * 3..si * 3 + 3]);
                             }
                         }
@@ -383,6 +402,10 @@ pub struct Mosaic {
     pub reference: Option<Reference>,
     /// Frames to wait before retrying a failed calibration (it is slow).
     calib_wait: u32,
+    /// Tracked motion since the last reference check, and that check's
+    /// reference position (None after a relocation).
+    track_acc: [f64; 2],
+    ref_last: Option<[f64; 2]>,
 }
 
 struct LayerRt {
@@ -652,6 +675,8 @@ impl Mosaic {
             join: true,
             reference: None,
             calib_wait: 0,
+            track_acc: [0.0; 2],
+            ref_last: None,
         }
     }
 
@@ -737,7 +762,8 @@ impl Mosaic {
             }
             self.pos = [0.0; 2];
             self.track = Track::Ok;
-            let touched = self.paste(f, &g);
+            // Either the base layer, or just located on the layer below.
+            let touched = self.paste(f, &g, CONF_HIGH);
             return (touched, 0.0, 0.0);
         }
 
@@ -821,48 +847,63 @@ impl Mosaic {
                 let still = ff.is_some_and(|m| m.dx.abs() * (SMALL as f32) <= self.max_speed && m.dy.abs() * (SMALL as f32) <= self.max_speed);
                 if still {
                     self.track = Track::Ok;
-                    return (self.paste(f, &g), peak, 0.0);
+                    return (self.paste(f, &g, CONF_HIGH), peak, 0.0);
                 }
                 // Moving: track from here, paste once it slows down.
                 self.track = Track::TooFast;
                 return (Vec::new(), peak, 0.0);
             }
             self.track = Track::Lost;
+            self.ref_last = None;
             return (Vec::new(), peak, 0.0);
         };
         self.lost_frames = 0;
         self.steady_lost = 0;
         let mut pos = pos;
-        // Absolute check against the lower layer: catches slips by a period
-        // of a repetitive structure, which frame-to-frame tracking cannot.
-        let mut slipped = false;
-        // Check frames about to be pasted (that is where a slip does
-        // damage), and every 5th frame while moving fast.
-        let quick = ((pos[0] - prev_pos[0]).powi(2) + (pos[1] - prev_pos[1]).powi(2)).sqrt() as f32 <= self.max_speed;
-        if !from_reference && (quick || self.seen % 5 == 0) {
+        // Motion as tracked (before any correction): used for speed gating
+        // and, accumulated between checks, for learning the layer scale.
+        let speed = ((pos[0] - prev_pos[0]).powi(2) + (pos[1] - prev_pos[1]).powi(2)).sqrt() as f32;
+        if from_reference {
+            self.ref_last = None;
+        } else {
+            self.track_acc = [self.track_acc[0] + pos[0] - prev_pos[0], self.track_acc[1] + pos[1] - prev_pos[1]];
+        }
+        // The lower layer is the authority on position: tracking only has to
+        // be right between checks. Check frames about to be pasted (where an
+        // error does damage), and every 5th frame while moving fast.
+        // Without a layer below, positions are as good as they get.
+        let mut conf = if self.reference.is_some() { CONF_LOW } else { CONF_HIGH };
+        if !from_reference && (speed <= self.max_speed || self.seen % 5 == 0) {
             if let Some(r) = &mut self.reference {
-                if let (Some(map), Some(q)) = (r.map, r.check(&g, w, h, pos, 0.3)) {
-                    let pred = map.apply(pos);
-                    let err = ((pred[0] - q[0]).powi(2) + (pred[1] - q[1]).powi(2)).sqrt();
-                    // Tolerance in reference pixels: a few pixels plus slack
-                    // for scale error far from the calibration point.
-                    if err > 4.0 + 0.002 * (pos[0].abs() + pos[1].abs()) * map.s {
-                        let p = map.invert(q);
-                        pos = self.refine(&self.canvas, &g, w, h, p, RELOC_MIN_COVER).map(|(p, _)| p).unwrap_or(p);
-                        slipped = true;
-                        self.events.push(format!("corrected a tracking slip of {:.0} px using the lower layer", err / map.s));
-                    } else {
-                        r.add_sample(pos, q);
+                let checked = r.check(&g, w, h, pos, 0.3);
+                if std::env::var_os("SCOPECAP_DEBUG_REF").is_some() {
+                    let pr = checked.zip(r.map).map(|(q, m)| m.invert(q));
+                    eprintln!("CHECK seen {} pos {:.1},{:.1} speed {:.1} → {:?}", self.seen, pos[0], pos[1], speed, pr.map(|p| [(p[0] * 10.0).round() / 10.0, (p[1] * 10.0).round() / 10.0]));
+                }
+                if let (Some(map), Some(q)) = (r.map, checked) {
+                    if let Some(lq) = self.ref_last {
+                        r.observe_motion(self.track_acc, [q[0] - lq[0], q[1] - lq[1]], pos, q);
+                    }
+                    self.ref_last = Some(q);
+                    self.track_acc = [0.0; 2];
+                    conf = CONF_HIGH;
+                    let pr = r.map.unwrap_or(map).invert(q);
+                    let err = ((pos[0] - pr[0]).powi(2) + (pos[1] - pr[1]).powi(2)).sqrt();
+                    if err > 2.0 {
+                        // Keep sub-pixel agreement with what this layer
+                        // already holds, but only within the reference's word.
+                        pos = match self.refine(&self.canvas, &g, w, h, pr, RELOC_MIN_COVER) {
+                            Some((p, _)) if ((p[0] - pr[0]).powi(2) + (p[1] - pr[1]).powi(2)).sqrt() <= 2.0 => p,
+                            _ => pr,
+                        };
+                        if err > 10.0 {
+                            self.events.push(format!("corrected a tracking slip of {err:.0} px using the lower layer"));
+                        }
                     }
                 }
             }
         }
         self.pos = pos;
-        if slipped {
-            self.track = Track::TooFast;
-            return (Vec::new(), peak, 0.0);
-        }
-        let speed = ((pos[0] - prev_pos[0]).powi(2) + (pos[1] - prev_pos[1]).powi(2)).sqrt() as f32;
         if self.track == Track::Lost {
             // Just relocated: the speed estimate is meaningless this frame.
             self.track = Track::TooFast;
@@ -882,7 +923,7 @@ impl Mosaic {
             }
         }
         self.track = Track::Ok;
-        (self.paste(f, &g), peak, speed)
+        (self.paste(f, &g, conf), peak, speed)
     }
 
     /// Precise position: the whole frame at 1/FINE resolution matched
@@ -1036,7 +1077,7 @@ impl Mosaic {
         (s, sw, sh, median)
     }
 
-    fn paste(&mut self, f: &Lin, g: &[f32]) -> Vec<(i32, i32)> {
+    fn paste(&mut self, f: &Lin, g: &[f32], conf: u8) -> Vec<(i32, i32)> {
         let (w, h) = (f.w, f.h);
         let (sharp, sw, sh, median) = Self::sharpness(g, w, h);
         self.sharp_floor =
@@ -1074,8 +1115,11 @@ impl Mosaic {
                     let sn = bilinear1(&sharp, sw, sh, sx, sy);
                     let i = (y - ty0) as usize * T + (x - tx0) as usize;
                     let so = tile.sharp[i];
-                    let a = if so < 0.0 {
+                    let co = tile.conf[i];
+                    let a = if so < 0.0 || conf > co {
                         1.0
+                    } else if conf < co {
+                        continue;
                     } else {
                         let r = (so + floor) / (sn + floor);
                         let r2 = r * r;
@@ -1095,7 +1139,8 @@ impl Mosaic {
                         let o = &mut tile.rgb[i * 3 + c];
                         *o = (*o as f32 * (1.0 - a) + nv * a + 0.5) as u16;
                     }
-                    tile.sharp[i] = so.max(sn);
+                    tile.sharp[i] = if conf > co { sn } else { so.max(sn) };
+                    tile.conf[i] = conf;
                 }
             }
             tile.update_low();
@@ -1110,7 +1155,7 @@ impl Mosaic {
         for py in 0..PT {
             for px in 0..PT {
                 let mut acc = [0.0f32; 3];
-                let mut n = 0;
+                let (mut n, mut high) = (0, 0);
                 for dy in 0..PREV {
                     for dx in 0..PREV {
                         let i = (py * PREV + dy) * T + px * PREV + dx;
@@ -1119,6 +1164,7 @@ impl Mosaic {
                                 acc[c] += t.rgb[i * 3 + c] as f32;
                             }
                             n += 1;
+                            high += (t.conf[i] == CONF_HIGH) as usize;
                         }
                     }
                 }
@@ -1130,7 +1176,7 @@ impl Mosaic {
                     let lin = acc[c] / n as f32 * (RANGE / 65535.0);
                     o[c] = proc::enc8((lin - lv.lo) * scale);
                 }
-                o[3] = 255;
+                o[3] = if high * 2 >= n { 255 } else { LOW_CONF_ALPHA };
             }
         }
         out
@@ -1149,7 +1195,7 @@ impl Mosaic {
                 let lin = t.rgb[i * 3 + c] as f32 * (RANGE / 65535.0);
                 out[i * 4 + c] = proc::enc8((lin - lv.lo) * scale);
             }
-            out[i * 4 + 3] = 255;
+            out[i * 4 + 3] = if t.conf[i] == CONF_HIGH { 255 } else { LOW_CONF_ALPHA };
         }
         out
     }

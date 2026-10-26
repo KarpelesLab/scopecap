@@ -47,8 +47,8 @@ pub struct Reference {
     /// Expected layer-(k−1) position of the first frame's centre (the
     /// objectives are roughly parcentric), if known.
     pub hint: Option<[f64; 2]>,
-    /// (p, q) pairs of frame origins used to refine the mapping.
-    samples: Vec<([f64; 2], [f64; 2])>,
+    /// Scale measurements from relative motion (see `observe_motion`).
+    scales: Vec<f64>,
     pcs: HashMap<(usize, usize, bool), PhaseCorr>,
     failed: u32,
 }
@@ -116,7 +116,7 @@ fn ncc(a: &[f32], b: &[f32]) -> f32 {
 
 impl Reference {
     pub fn new(canvas: Arc<Canvas>, nominal: f64, hint: Option<[f64; 2]>, map: Option<Sim>) -> Self {
-        Reference { canvas, nominal, map, hint, samples: Vec::new(), pcs: HashMap::new(), failed: 0 }
+        Reference { canvas, nominal, map, hint, scales: Vec::new(), pcs: HashMap::new(), failed: 0 }
     }
 
     /// Find a frame near `guess` (its origin in reference pixels), searching
@@ -293,7 +293,6 @@ impl Reference {
         }
         let map = Sim { s, tx: q[0], ty: q[1] };
         self.map = Some(map);
-        self.samples = vec![([0.0, 0.0], q)];
         Some(map)
     }
 
@@ -307,44 +306,30 @@ impl Reference {
         Some(q)
     }
 
-    pub fn add_sample(&mut self, p: [f64; 2], q: [f64; 2]) {
-        self.samples.push((p, q));
-        if self.samples.len() % 25 == 0 {
-            self.refit();
-        }
-    }
-
-    /// Least-squares q = s·p + t over the samples, with outlier trimming.
-    /// Only updates once the samples span enough of the layer for the scale
-    /// to be well determined.
-    fn refit(&mut self) {
+    /// Learn the scale from relative motion: the layer's own tracking says
+    /// the view moved by `dp` (layer px) while the reference says `dq`. Only
+    /// differences are used, so tracking drift cannot bias it. The mapping
+    /// is kept fixed at the current point (`p` ↔ `q`) when the scale changes,
+    /// and frozen after enough measurements.
+    pub fn observe_motion(&mut self, dp: [f64; 2], dq: [f64; 2], p: [f64; 2], q: [f64; 2]) {
+        const FREEZE_AFTER: usize = 100;
         let Some(map) = self.map else { return };
-        let mut keep: Vec<&([f64; 2], [f64; 2])> = self.samples.iter().collect();
-        for _ in 0..2 {
-            let n = keep.len() as f64;
-            if n < 10.0 {
-                return;
-            }
-            let pm = [keep.iter().map(|x| x.0[0]).sum::<f64>() / n, keep.iter().map(|x| x.0[1]).sum::<f64>() / n];
-            let qm = [keep.iter().map(|x| x.1[0]).sum::<f64>() / n, keep.iter().map(|x| x.1[1]).sum::<f64>() / n];
-            let (mut num, mut den) = (0.0, 0.0);
-            for (p, q) in &keep {
-                let (dp, dq) = ([p[0] - pm[0], p[1] - pm[1]], [q[0] - qm[0], q[1] - qm[1]]);
-                num += dp[0] * dq[0] + dp[1] * dq[1];
-                den += dp[0] * dp[0] + dp[1] * dp[1];
-            }
-            // Need a spread of at least ~1000 layer pixels (RMS).
-            if den / n < 1000.0 * 1000.0 {
-                return;
-            }
-            let s = num / den;
-            let fit = Sim { s, tx: qm[0] - s * pm[0], ty: qm[1] - s * pm[1] };
-            keep.retain(|(p, q)| {
-                let e = fit.apply(*p);
-                ((e[0] - q[0]).powi(2) + (e[1] - q[1]).powi(2)).sqrt() < 3.0
-            });
-            if (s / map.s - 1.0).abs() < 0.03 {
-                self.map = Some(fit);
+        let len = (dp[0] * dp[0] + dp[1] * dp[1]).sqrt();
+        if self.scales.len() >= FREEZE_AFTER || !(300.0..3000.0).contains(&len) {
+            return;
+        }
+        let s = (dp[0] * dq[0] + dp[1] * dq[1]) / (len * len);
+        if (s / map.s - 1.0).abs() > 0.03 {
+            return;
+        }
+        self.scales.push(s);
+        if self.scales.len() >= 10 && self.scales.len() % 5 == 0 {
+            let mut v = self.scales.clone();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let s = v[v.len() / 2];
+            self.map = Some(Sim { s, tx: q[0] - s * p[0], ty: q[1] - s * p[1] });
+            if std::env::var_os("SCOPECAP_DEBUG_REF").is_some() {
+                eprintln!("  scale from motion: {s:.5} ({} samples)", self.scales.len());
             }
         }
     }
