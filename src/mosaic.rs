@@ -798,9 +798,13 @@ impl Mosaic {
         }
         let mut from_reference = false;
         if found.is_none() && self.reference.as_ref().is_some_and(|r| r.map.is_some()) {
-            // Relocate on the lower layer: a wide search around where we were.
+            // Relocate on the lower layer: a wide search around where we
+            // were every frame, and the whole layer every 10th lost frame
+            // (after a fast move the view can be anywhere).
+            self.lost_frames += 1;
             let r = self.reference.as_mut().unwrap();
-            if let Some(q) = r.check(&g, w, h, self.pos, 1.5) {
+            let q = r.check(&g, w, h, self.pos, 1.5).or_else(|| (self.lost_frames % 10 == 5).then(|| r.find(&g, w, h)).flatten());
+            if let Some(q) = q {
                 let p = r.map.unwrap().invert(q);
                 found = Some(self.refine(&self.canvas, &g, w, h, p, RELOC_MIN_COVER).map(|(p, _)| p).unwrap_or(p));
                 from_reference = true;

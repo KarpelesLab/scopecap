@@ -306,6 +306,15 @@ impl Reference {
         Some(q)
     }
 
+    /// Locate a frame anywhere on the reference (coarse whole-layer search,
+    /// then confirmed at half resolution). Returns the reference origin.
+    pub fn find(&mut self, g: &[f32], w: usize, h: usize) -> Option<[f64; 2]> {
+        let map = self.map?;
+        let rough = self.global(g, w, h, map.s)?;
+        let (f, fw, fh) = shrink(g, w, h, map.s / 2.0);
+        self.locate(&f, fw, fh, rough, 0.3, 2).map(|(q, _)| q)
+    }
+
     /// Learn the scale from relative motion: the layer's own tracking says
     /// the view moved by `dp` (layer px) while the reference says `dq`. Only
     /// differences are used, so tracking drift cannot bias it. The mapping
