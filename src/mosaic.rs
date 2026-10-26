@@ -29,7 +29,7 @@ const T: usize = TILE as usize;
 pub const PREV: usize = 4;
 pub const PT: usize = T / PREV;
 /// Each tile keeps a 1/LOW green thumbnail for searching islands.
-const LOW: usize = 8;
+pub const LOW: usize = 8;
 const LT: usize = T / LOW;
 /// u16 canvas storage covers linear values 0..RANGE (WB gains can push >1).
 const RANGE: f32 = 4.0;
@@ -114,6 +114,31 @@ pub struct Canvas {
 }
 
 impl Canvas {
+    /// Rebuild a canvas from exported RGBA tiles (sRGB, alpha 0 = empty);
+    /// used to replay against an earlier export (examples/calibtest.rs).
+    #[allow(dead_code)]
+    pub fn from_rgba_tiles(tiles: Vec<((i32, i32), Vec<u8>)>) -> Canvas {
+        let mut c = Canvas::default();
+        for (k, rgba) in tiles {
+            let mut t = Tile::new();
+            for i in 0..T * T {
+                if rgba[i * 4 + 3] == 0 {
+                    continue;
+                }
+                for ch in 0..3 {
+                    let lin = proc::srgb_to_lin(rgba[i * 4 + ch] as f32 / 255.0);
+                    t.rgb[i * 3 + ch] = (lin / RANGE * 65535.0) as u16;
+                }
+                t.sharp[i] = 0.0;
+            }
+            t.update_low();
+            let (x, y) = (k.0 as f32 * T as f32, k.1 as f32 * T as f32);
+            c.bounds = Some(union(c.bounds, [x, y, x + T as f32, y + T as f32]));
+            c.tiles.insert(k, t);
+        }
+        c
+    }
+
     /// Green channel at full resolution; NaN where empty.
     pub fn green(&self, x0: i64, y0: i64, w: usize, h: usize) -> Vec<f32> {
         let mut out = vec![f32::NAN; w * h];
@@ -142,7 +167,7 @@ impl Canvas {
     /// The whole canvas at 1/LOW resolution, with `mx`/`my` low-res pixels
     /// of empty margin, sized for FFT. Returns (image, w, h, origin x, origin y)
     /// with the origin in low-res canvas coordinates.
-    fn low_image(&self, mx: usize, my: usize) -> Option<(Vec<f32>, usize, usize, i64, i64)> {
+    pub fn low_image(&self, mx: usize, my: usize) -> Option<(Vec<f32>, usize, usize, i64, i64)> {
         let b = self.bounds?;
         let lx0 = (b[0] as i64).div_euclid(LOW as i64) - mx as i64;
         let ly0 = (b[1] as i64).div_euclid(LOW as i64) - my as i64;
@@ -569,7 +594,7 @@ fn green(f: &Lin) -> Vec<f32> {
     f.data.par_chunks(3).map(|p| p[1]).collect()
 }
 
-fn downsample(g: &[f32], w: usize, h: usize, div: usize) -> (Vec<f32>, usize, usize) {
+pub fn downsample(g: &[f32], w: usize, h: usize, div: usize) -> (Vec<f32>, usize, usize) {
     let (sw, sh) = (w / div, h / div);
     let mut out = vec![0.0; sw * sh];
     out.par_chunks_mut(sw).enumerate().for_each(|(sy, line)| {
@@ -811,14 +836,17 @@ impl Mosaic {
         // Absolute check against the lower layer: catches slips by a period
         // of a repetitive structure, which frame-to-frame tracking cannot.
         let mut slipped = false;
-        if !from_reference {
+        // Check frames about to be pasted (that is where a slip does
+        // damage), and every 5th frame while moving fast.
+        let quick = ((pos[0] - prev_pos[0]).powi(2) + (pos[1] - prev_pos[1]).powi(2)).sqrt() as f32 <= self.max_speed;
+        if !from_reference && (quick || self.seen % 5 == 0) {
             if let Some(r) = &mut self.reference {
                 if let (Some(map), Some(q)) = (r.map, r.check(&g, w, h, pos, 0.3)) {
                     let pred = map.apply(pos);
                     let err = ((pred[0] - q[0]).powi(2) + (pred[1] - q[1]).powi(2)).sqrt();
                     // Tolerance in reference pixels: a few pixels plus slack
                     // for scale error far from the calibration point.
-                    if err > 2.5 + 0.002 * (pos[0].abs() + pos[1].abs()) * map.s {
+                    if err > 4.0 + 0.002 * (pos[0].abs() + pos[1].abs()) * map.s {
                         let p = map.invert(q);
                         pos = self.refine(&self.canvas, &g, w, h, p, RELOC_MIN_COVER).map(|(p, _)| p).unwrap_or(p);
                         slipped = true;

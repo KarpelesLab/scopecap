@@ -78,6 +78,8 @@ pub struct App {
     scan: ScanView,
     /// The scan project (directory, contents); created on the first scan.
     project: Option<(PathBuf, Project)>,
+    /// "Next zoom" pressed: waiting for the user to change objective.
+    pending_zoom: Option<f32>,
 }
 
 const HIST: usize = 240;
@@ -110,6 +112,7 @@ impl App {
                 bg_generation: 0,
             },
             project: None,
+            pending_zoom: None,
         };
         if let Err(e) = app.open_camera(cc.egui_ctx.clone()) {
             app.error = Some(format!("{e:#}"));
@@ -297,6 +300,10 @@ impl eframe::App for App {
             }
         });
 
+        if let Some(mag) = self.pending_zoom {
+            self.zoom_modal(ctx, mag, &stats);
+        }
+
         if self.settings != before {
             self.push_settings();
         }
@@ -457,9 +464,11 @@ impl App {
         match action {
             Some("start") => self.start_layer(st),
             Some("next") => {
+                // Stop recording now; the new layer starts once the user
+                // confirms the objective change (no frames of the turret
+                // turning or of refocusing).
                 self.cam.as_mut().unwrap().end_session();
-                self.settings.objective = next.unwrap();
-                self.start_layer(st);
+                self.pending_zoom = next;
             }
             Some("pause") => self.cam.as_ref().unwrap().pause_scan(),
             Some("clear") => {
@@ -526,6 +535,48 @@ impl App {
             ui.small(l);
         }
         ui.small("Move slowly; pause and sweep focus over uneven areas — the sharpest version of each spot is kept.");
+    }
+
+    fn zoom_modal(&mut self, ctx: &egui::Context, mag: f32, st: &Stats) {
+        let mut go = None;
+        egui::Modal::new(egui::Id::unique("next_zoom")).show(ctx, |ui| {
+            ui.set_width(520.0);
+            ui.heading(format!("Switch to the {} objective", mag_label(mag)));
+            ui.label(
+                "Turn the nosepiece, refocus, and keep the view on an area already scanned at the lower \
+                 zoom. Press Continue when the image is sharp.",
+            );
+            if let Some(tex) = &self.tex {
+                let [w, h] = self.frame_size;
+                let size = Vec2::new(500.0, 500.0 * h as f32 / w.max(1) as f32);
+                ui.add(egui::Image::new((tex.id(), size)));
+            }
+            let rel = if self.focus_peak > 0.0 { st.focus / self.focus_peak } else { 0.0 };
+            ui.add(egui::ProgressBar::new(rel.clamp(0.0, 1.0)).text(format!("sharpness {:.0}% of best", rel * 100.0)));
+            if ui.small_button("reset best").clicked() {
+                self.focus_peak = st.focus;
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button(RichText::new(format!("Continue at {}", mag_label(mag))).strong()).clicked() {
+                    go = Some(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    go = Some(false);
+                }
+            });
+        });
+        match go {
+            Some(true) => {
+                self.pending_zoom = None;
+                self.settings.objective = mag;
+                // New objective: the sharpness scale changes completely.
+                self.focus_peak = 0.0;
+                self.start_layer(st);
+            }
+            Some(false) => self.pending_zoom = None,
+            None => {}
+        }
     }
 
     /// Start or resume scanning the layer for the current objective,

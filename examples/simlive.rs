@@ -36,7 +36,11 @@ fn main() -> anyhow::Result<()> {
         let frames: Vec<recorder::FrameRec> = recorder::read_jsonl(&std::path::Path::new(dir).join("frames.jsonl"))?;
         let stream = std::fs::read(std::path::Path::new(dir).join("stream.mjpeg"))?;
         let mut dec = proc::make_decoder(1920, 1080).map_err(|e| anyhow::anyhow!("{e}"))?;
-        for f in &frames {
+        // SIMLIVE_LIMIT=n: only the first n frames of each session.
+        let limit: usize = std::env::var("SIMLIVE_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+        let (mut ms, mut n) = (Vec::new(), 0);
+        let mut states = std::collections::BTreeMap::new();
+        for f in frames.iter().take(limit) {
             let jpeg = stream[f.off as usize..f.off as usize + f.len as usize].to_vec();
             let Some((lin, _)) = proc::decode(dec.as_mut(), jpeg, 1920, 1080) else { continue };
             pending.fetch_add(1, Ordering::SeqCst);
@@ -44,6 +48,21 @@ fn main() -> anyhow::Result<()> {
             while pending.load(Ordering::SeqCst) > 0 {
                 std::thread::yield_now();
             }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            {
+                let s = shared.lock().unwrap();
+                ms.push(s.ms);
+                *states.entry(format!("{:?}", s.track)).or_insert(0) += 1;
+                if std::env::var_os("SIMLIVE_TRACE").is_some() {
+                    println!("    {} {:?} pos {:?} peak {:.0} speed {:.1} {:.1}ms", f.seq, s.track, s.frame_pos, s.peak, s.speed, s.ms);
+                }
+            }
+            n += 1;
+        }
+        ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        if !ms.is_empty() {
+            println!("  states {states:?}");
+            println!("  {n} frames, ms median {:.1} p90 {:.1} max {:.1}", ms[ms.len() / 2], ms[ms.len() * 9 / 10], ms[ms.len() - 1]);
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
         let s = shared.lock().unwrap();

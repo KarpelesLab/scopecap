@@ -8,13 +8,14 @@
   :root { --bg: #141414; --panel: rgba(30,30,30,.85); --fg: #ddd; --muted: #999; }
   html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
     font: 13px/1.4 system-ui, sans-serif; overflow: hidden; }
-  #view { position: absolute; inset: 0; cursor: grab; touch-action: none; }
+  /* Own stacking context, so tile z-indexes never cover the controls. */
+  #view { position: absolute; inset: 0; z-index: 0; cursor: grab; touch-action: none; }
   #view.drag { cursor: grabbing; }
   #view img { position: absolute; transform-origin: 0 0; user-select: none; -webkit-user-drag: none; }
   #view.pixelated img { image-rendering: pixelated; }
-  #hud { position: absolute; left: 12px; bottom: 12px; background: var(--panel); padding: 6px 10px;
+  #hud { position: absolute; z-index: 1; left: 12px; bottom: 12px; background: var(--panel); padding: 6px 10px;
     border-radius: 6px; pointer-events: none; font-variant-numeric: tabular-nums; }
-  #bar { position: absolute; right: 12px; top: 12px; display: flex; gap: 6px; }
+  #bar { position: absolute; z-index: 1; right: 12px; top: 12px; display: flex; gap: 6px; }
   #bar button { background: var(--panel); color: var(--fg); border: 1px solid #444; border-radius: 6px;
     padding: 6px 10px; font: inherit; cursor: pointer; }
   #bar button:hover { border-color: #888; }

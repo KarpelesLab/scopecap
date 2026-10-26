@@ -8,7 +8,7 @@
 //! camera, only the objective changes): q = s·p + t, with p in layer-k
 //! canvas pixels and q in layer-(k−1) canvas pixels.
 
-use crate::mosaic::Canvas;
+use crate::mosaic::{downsample, Canvas, LOW};
 use crate::register::PhaseCorr;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -86,6 +86,17 @@ pub fn scale_down(g: &[f32], w: usize, h: usize, s: f64) -> (Vec<f32>, usize, us
     (out, ow, oh)
 }
 
+/// Resample by `s` (< 1): integer box-shrink first (fast, parallel), then
+/// the exact fractional remainder on the much smaller image.
+pub fn shrink(g: &[f32], w: usize, h: usize, s: f64) -> (Vec<f32>, usize, usize) {
+    let k = ((1.0 / s).floor() as usize).max(1);
+    if k == 1 {
+        return scale_down(g, w, h, s);
+    }
+    let (g2, w2, h2) = downsample(g, w, h, k);
+    scale_down(&g2, w2, h2, s * k as f64)
+}
+
 fn ncc(a: &[f32], b: &[f32]) -> f32 {
     let pairs: Vec<(f32, f32)> = a.iter().zip(b).filter(|(x, _)| !x.is_nan()).map(|(x, y)| (*x, *y)).collect();
     if pairs.len() < a.len() / 5 {
@@ -108,14 +119,16 @@ impl Reference {
         Reference { canvas, nominal, map, hint, samples: Vec::new(), pcs: HashMap::new(), failed: 0 }
     }
 
-    /// Find a frame (already scaled to reference resolution) near `guess`
-    /// (its origin in reference pixels), searching ±`radius` frame sizes.
-    /// Returns the matched origin and the correlation PNR.
-    fn locate(&mut self, f: &[f32], fw: usize, fh: usize, guess: [f64; 2], radius: f64) -> Option<([f64; 2], f32)> {
+    /// Find a frame near `guess` (its origin in reference pixels), searching
+    /// ±`radius` frame sizes. Works at 1/`div` of reference resolution; `f`
+    /// must already be scaled to that (fw×fh). Returns the matched origin
+    /// (reference pixels) and the correlation PNR.
+    fn locate(&mut self, f: &[f32], fw: usize, fh: usize, guess: [f64; 2], radius: f64, div: usize) -> Option<([f64; 2], f32)> {
+        let d = div as f64;
         let (mx, my) = ((fw as f64 * radius).ceil() as usize, (fh as f64 * radius).ceil() as usize);
         let (rw, rh) = ((fw + 2 * mx).div_ceil(16) * 16, (fh + 2 * my).div_ceil(16) * 16);
-        let (ox, oy) = (guess[0].round() as i64 - mx as i64, guess[1].round() as i64 - my as i64);
-        let mut a = self.canvas.green(ox, oy, rw, rh);
+        let (ox, oy) = ((guess[0] / d).round() as i64 - mx as i64, (guess[1] / d).round() as i64 - my as i64);
+        let mut a = self.region(ox, oy, rw, rh, div);
         let covered = a.iter().filter(|v| !v.is_nan()).count();
         if covered < fw * fh / 4 {
             return None;
@@ -139,16 +152,73 @@ impl Reference {
         }
         let pc = self.pcs.entry((rw, rh, true)).or_insert_with(|| PhaseCorr::new(rw, rh, LOWPASS));
         let m = pc.correlate(&a, &b);
+        let debug = std::env::var_os("SCOPECAP_DEBUG_REF").is_some();
         if m.pnr < MIN_PNR {
+            if debug {
+                eprintln!("  locate {fw}x{fh} /{div} in {rw}x{rh} at {guess:?}: pnr {:.1} (too low)", m.pnr);
+            }
             return None;
         }
-        let q = [ox as f64 + mx as f64 - m.dx as f64, oy as f64 + my as f64 - m.dy as f64];
+        let qd = [ox as f64 + mx as f64 - m.dx as f64, oy as f64 + my as f64 - m.dy as f64];
         // Pixel-wise check at the found position.
-        let c = self.canvas.green(q[0].round() as i64, q[1].round() as i64, fw, fh);
-        if ncc(&c, f) < MIN_NCC {
+        let c = self.region(qd[0].round() as i64, qd[1].round() as i64, fw, fh, div);
+        let n = ncc(&c, f);
+        let q = [qd[0] * d, qd[1] * d];
+        if debug {
+            eprintln!("  locate {fw}x{fh} /{div} in {rw}x{rh} at {guess:?}: pnr {:.1} → {q:?}, ncc {n:.3}", m.pnr);
+        }
+        if n < MIN_NCC {
             return None;
         }
         Some((q, m.pnr))
+    }
+
+    /// Reference green at 1/`div` resolution; (x0, y0) in those units.
+    fn region(&self, x0: i64, y0: i64, w: usize, h: usize, div: usize) -> Vec<f32> {
+        if div == 1 {
+            return self.canvas.green(x0, y0, w, h);
+        }
+        let full = self.canvas.green(x0 * div as i64, y0 * div as i64, w * div, h * div);
+        // NaN propagates: partially covered cells count as empty.
+        downsample(&full, w * div, h * div, div).0
+    }
+
+    /// Whole-reference search at 1/LOW resolution (using the canvas tile
+    /// thumbnails), at scale `s`. Returns a rough frame origin.
+    fn global(&mut self, g: &[f32], w: usize, h: usize, s: f64) -> Option<[f64; 2]> {
+        let (f, fw, fh) = shrink(g, w, h, s / LOW as f64);
+        let (mut a, lw, lh, lx0, ly0) = self.canvas.low_image(fw, fh)?;
+        let covered = a.iter().filter(|v| !v.is_nan()).count();
+        if covered == 0 {
+            return None;
+        }
+        let mean_a = a.iter().filter(|v| !v.is_nan()).sum::<f32>() / covered as f32;
+        for v in &mut a {
+            if v.is_nan() {
+                *v = mean_a;
+            }
+        }
+        let mean_f = f.iter().sum::<f32>() / f.len() as f32;
+        let hann = |n: usize, i: usize| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * (i as f32 + 0.5) / n as f32).cos();
+        let mut b = vec![mean_f; lw * lh];
+        for y in 0..fh {
+            for x in 0..fw {
+                b[y * lw + x] = mean_f + (f[y * fw + x] - mean_f) * hann(fw, x) * hann(fh, y);
+            }
+        }
+        // The search image's borders are mean-padded margins: no window, or
+        // matches near the edges of the reference would be suppressed.
+        let pc = self.pcs.entry((lw, lh, false)).or_insert_with(|| PhaseCorr::new_unwindowed(lw, lh, LOWPASS));
+        let m = pc.correlate(&a, &b);
+        if std::env::var_os("SCOPECAP_DEBUG_REF").is_some() {
+            eprintln!("  global {fw}x{fh} in {lw}x{lh}: pnr {:.1}", m.pnr);
+        }
+        if m.pnr < MIN_PNR {
+            return None;
+        }
+        let ix = (-m.dx as f64).rem_euclid(lw as f64);
+        let iy = (-m.dy as f64).rem_euclid(lh as f64);
+        Some([(lx0 as f64 + ix) * LOW as f64, (ly0 as f64 + iy) * LOW as f64])
     }
 
     /// Establish the mapping from the first frame of the layer (at layer
@@ -171,14 +241,9 @@ impl Reference {
         let hint = match self.hint {
             Some(hc) => hc,
             None => {
-                // No idea where we are: search the whole reference at its
-                // own coarse resolution, at the nominal scale.
-                let b = self.canvas.bounds?;
-                let c = [(b[0] + b[2]) as f64 / 2.0, (b[1] + b[3]) as f64 / 2.0];
-                let (f, fw, fh) = scale_down(g, w, h, self.nominal);
-                let rad = (((b[2] - b[0]) as f64 / fw as f64).max((b[3] - b[1]) as f64 / fh as f64) / 2.0 + 0.5).min(4.0);
+                // No idea where we are: search the whole reference at 1/LOW.
+                let q = self.global(g, w, h, self.nominal)?;
                 let s = self.nominal;
-                let (q, _) = self.locate(&f, fw, fh, [c[0] - centre(s)[0], c[1] - centre(s)[1]], rad)?;
                 [q[0] + centre(s)[0], q[1] + centre(s)[1]]
             }
         };
@@ -186,8 +251,8 @@ impl Reference {
         let mut found = None;
         for k in [0.0, 0.03, -0.03, 0.06, -0.06] {
             let s = self.nominal * (1.0 + k);
-            let (f, fw, fh) = scale_down(g, w, h, s);
-            if let Some((q, _)) = self.locate(&f, fw, fh, [hint[0] - centre(s)[0], hint[1] - centre(s)[1]], 1.0) {
+            let (f, fw, fh) = shrink(g, w, h, s / 2.0);
+            if let Some((q, _)) = self.locate(&f, fw, fh, [hint[0] - centre(s)[0], hint[1] - centre(s)[1]], 1.0, 2) {
                 found = Some((s, q));
                 break;
             }
@@ -200,8 +265,8 @@ impl Reference {
         let mut scores = Vec::new();
         for i in -12..=12 {
             let s = self.nominal * (1.0 + i as f64 * 0.005);
-            let (f, fw, fh) = scale_down(g, w, h, s);
-            let r = self.locate(&f, fw, fh, [c0[0] - centre(s)[0], c0[1] - centre(s)[1]], 0.1);
+            let (f, fw, fh) = shrink(g, w, h, s);
+            let r = self.locate(&f, fw, fh, [c0[0] - centre(s)[0], c0[1] - centre(s)[1]], 0.1, 1);
             scores.push((s, r.map(|x| x.1).unwrap_or(0.0)));
             if let Some((q, pnr)) = r {
                 if best.is_none_or(|b| pnr > b.2) {
@@ -218,8 +283,8 @@ impl Reference {
                 if den < 0.0 {
                     let off = (0.5 * (a - c) / den).clamp(-0.5, 0.5);
                     let s2 = s + off * self.nominal * 0.005;
-                    let (f, fw, fh) = scale_down(g, w, h, s2);
-                    if let Some((q2, _)) = self.locate(&f, fw, fh, q, 0.1) {
+                    let (f, fw, fh) = shrink(g, w, h, s2);
+                    if let Some((q2, _)) = self.locate(&f, fw, fh, q, 0.1, 1) {
                         s = s2;
                         q = q2;
                     }
@@ -237,8 +302,8 @@ impl Reference {
     /// refining the mapping. Returns the reference-pixel origin.
     pub fn check(&mut self, g: &[f32], w: usize, h: usize, p: [f64; 2], radius: f64) -> Option<[f64; 2]> {
         let map = self.map?;
-        let (f, fw, fh) = scale_down(g, w, h, map.s);
-        let (q, _) = self.locate(&f, fw, fh, map.apply(p), radius)?;
+        let (f, fw, fh) = shrink(g, w, h, map.s / 2.0);
+        let (q, _) = self.locate(&f, fw, fh, map.apply(p), radius, 2)?;
         Some(q)
     }
 
