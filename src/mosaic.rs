@@ -49,6 +49,9 @@ pub const MARGIN: f32 = 8.0;
 const EDGE_RAMP: f32 = 160.0;
 /// While tracking with other islands around, search them every N frames.
 const SEARCH_EVERY: u32 = 8;
+/// Correlation peaks at least this fraction of the strongest count as
+/// candidates; the one nearest the expected position wins.
+const NEAR_MIN_REL: f32 = 0.8;
 /// Consecutive still frames required before pasting resumes after motion.
 const SETTLE_FRAMES: u32 = 2;
 /// Consecutive lost frames with a clear view before a new island is started.
@@ -445,6 +448,11 @@ pub struct Mosaic {
     /// Consecutive frames below the speed limit.
     still_run: u32,
     last_conf: u8,
+    /// Last frame-to-frame motion (1/SMALL px), the expectation for the next.
+    last_ff: [f32; 2],
+    /// Consecutive checks disagreeing with the lower layer beyond its
+    /// ambiguity scale.
+    disagree: u32,
 }
 
 struct LayerRt {
@@ -721,6 +729,8 @@ impl Mosaic {
             ref_last: None,
             still_run: 0,
             last_conf: CONF_HIGH,
+            last_ff: [0.0; 2],
+            disagree: 0,
         }
     }
 
@@ -728,6 +738,7 @@ impl Mosaic {
     /// state; the first frames relocate against what exists.
     pub fn resume(&mut self) {
         self.prev_small = None;
+        self.last_ff = [0.0; 2];
         self.track = if self.canvas.tiles.is_empty() { Track::Ok } else { Track::Lost };
     }
 
@@ -847,9 +858,18 @@ impl Mosaic {
         let prev_pos = self.pos;
         let mut peak = 0.0;
         let mut found = None;
+        // Whether the position was aligned against this layer's own content.
+        let mut anchored = false;
         // Frame-to-frame motion: the tracking estimate, and also tells
         // whether the view is steady while lost.
-        let ff = self.prev_small.as_ref().map(|p| self.pc_small.as_ref().unwrap().correlate(p, &small));
+        // Expect roughly the previous frame's motion; on periodic structures
+        // this picks the right period among near-equal peaks.
+        let (ex, ey) = (self.last_ff[0], self.last_ff[1]);
+        let ff = self.prev_small.as_ref().map(|p| self.pc_small.as_ref().unwrap().correlate_near(p, &small, ex, ey, NEAR_MIN_REL));
+        self.last_ff = match ff {
+            Some(m) if m.pnr >= COARSE_MIN_PNR && self.track != Track::Lost => [m.dx, m.dy],
+            _ => [0.0; 2],
+        };
         if self.track != Track::Lost {
             if let Some(m) = ff.filter(|m| m.pnr >= COARSE_MIN_PNR) {
                 peak = m.pnr;
@@ -859,7 +879,9 @@ impl Mosaic {
                 ];
                 // Fine alignment against the canvas removes drift; fall
                 // back to the coarse estimate over unexplored areas.
-                found = Some(self.refine(&self.canvas, &g, w, h, guess, 0.4).map(|(p, _)| p).unwrap_or(guess));
+                let refined = self.refine(&self.canvas, &g, w, h, guess, 0.4, true);
+                anchored = refined.is_some();
+                found = Some(refined.map(|(p, _)| p).unwrap_or(guess));
             }
         }
         if found.is_none() {
@@ -868,7 +890,7 @@ impl Mosaic {
             if let Some((guess, rp)) = self.relocate(&small, sw, sh, w, h) {
                 peak = rp;
                 found = self
-                    .refine(&self.canvas, &g, w, h, guess, RELOC_MIN_COVER)
+                    .refine(&self.canvas, &g, w, h, guess, RELOC_MIN_COVER, true)
                     .map(|(p, _)| p)
                     .filter(|p| verify(&self.canvas, &small, w, h, *p));
             }
@@ -883,7 +905,7 @@ impl Mosaic {
             let q = r.check(&g, w, h, self.pos, 1.5).or_else(|| (self.lost_frames % 10 == 5).then(|| r.find(&g, w, h)).flatten());
             if let Some(q) = q {
                 let p = r.map.unwrap().invert(q);
-                found = Some(self.refine(&self.canvas, &g, w, h, p, RELOC_MIN_COVER).map(|(p, _)| p).unwrap_or(p));
+                found = Some(self.refine(&self.canvas, &g, w, h, p, RELOC_MIN_COVER, false).map(|(p, _)| p).unwrap_or(p));
                 from_reference = true;
             }
         }
@@ -970,15 +992,30 @@ impl Mosaic {
                     conf = CONF_HIGH;
                     let pr = r.map.unwrap_or(map).invert(q);
                     let err = ((pos[0] - pr[0]).powi(2) + (pos[1] - pr[1]).powi(2)).sqrt();
-                    if err > 2.0 {
-                        // Keep sub-pixel agreement with what this layer
-                        // already holds, but only within the reference's word.
-                        pos = match self.refine(&self.canvas, &g, w, h, pr, RELOC_MIN_COVER) {
-                            Some((p, _)) if ((p[0] - pr[0]).powi(2) + (p[1] - pr[1]).powi(2)).sqrt() <= 2.0 => p,
-                            _ => pr,
-                        };
-                        if err > 10.0 {
+                    // Below this the lower layer can't tell periods of a
+                    // repeating structure apart (16 of its pixels, as checked
+                    // at half resolution): a frame aligned on this layer's
+                    // own content is more trustworthy there.
+                    let ambiguous = 16.0 / map.s;
+                    if err > ambiguous {
+                        // A real slip if it persists: correct it.
+                        self.disagree += 1;
+                        if self.disagree >= 2 {
+                            self.disagree = 0;
+                            pos = match self.refine(&self.canvas, &g, w, h, pr, RELOC_MIN_COVER, true) {
+                                Some((p, _)) if ((p[0] - pr[0]).powi(2) + (p[1] - pr[1]).powi(2)).sqrt() <= 2.0 => p,
+                                _ => pr,
+                            };
                             self.events.push(format!("corrected a tracking slip of {err:.0} px using the lower layer"));
+                        } else {
+                            conf = CONF_LOW;
+                        }
+                    } else {
+                        self.disagree = 0;
+                        if !anchored && err > 2.0 {
+                            // New territory: nothing of this layer to align
+                            // with, so the lower layer keeps it from drifting.
+                            pos = pr;
                         }
                     }
                 }
@@ -1016,7 +1053,10 @@ impl Mosaic {
 
     /// Precise position: the whole frame at 1/FINE resolution matched
     /// against `canvas` at `guess`; requires `min_cover` of it to exist.
-    fn refine(&self, canvas: &Canvas, g: &[f32], w: usize, h: usize, guess: [f64; 2], min_cover: f32) -> Option<([f64; 2], f32)> {
+    /// `near`: the guess is trusted to within a period of repeating
+    /// structures, so prefer the matching peak nearest to it; otherwise take
+    /// the strongest (guess from a coarser source, e.g. the lower layer).
+    fn refine(&self, canvas: &Canvas, g: &[f32], w: usize, h: usize, guess: [f64; 2], min_cover: f32, near: bool) -> Option<([f64; 2], f32)> {
         let pc = self.pc_fine.as_ref()?;
         let (gx, gy) = (guess[0].round(), guess[1].round());
         let full = canvas.green(gx as i64, gy as i64, w, h);
@@ -1025,7 +1065,9 @@ impl Mosaic {
             return None;
         }
         let (b, _, _) = downsample(g, w, h, FINE);
-        let m = pc.correlate(&a, &b);
+        // The guess is the expected position: among near-equal peaks
+        // (periodic structures), keep the one that agrees with it.
+        let m = if near { pc.correlate_near(&a, &b, 0.0, 0.0, NEAR_MIN_REL) } else { pc.correlate(&a, &b) };
         let lim = 64.0 / FINE as f32;
         if m.pnr < FINE_MIN_PNR || m.dx.abs() > lim || m.dy.abs() > lim {
             return None;
@@ -1099,7 +1141,7 @@ impl Mosaic {
             let ix = (-m.dx).rem_euclid(lw as f32);
             let iy = (-m.dy).rem_euclid(lh as f32);
             let guess = [((lx0 as f32 + ix) * LOW as f32) as f64, ((ly0 as f32 + iy) * LOW as f32) as f64];
-            if let Some((p, _)) = self.refine(canvas, g, w, h, guess, RELOC_MIN_COVER) {
+            if let Some((p, _)) = self.refine(canvas, g, w, h, guess, RELOC_MIN_COVER, false) {
                 let (small, _, _) = downsample(g, w, h, SMALL);
                 if verify(canvas, &small, w, h, p) {
                     return Some((which, p));

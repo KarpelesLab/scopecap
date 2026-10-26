@@ -18,6 +18,20 @@ pub struct Sample {
     pub blocks: Vec<f32>,
 }
 
+/// Blocks darker than this fraction of the samples' median brightness are
+/// too noisy to use (relative, so dark samples still work).
+const DARK_FRACTION: f32 = 0.15;
+
+/// Brightness floor for `samples`: DARK_FRACTION of the median green.
+fn dark_floor(samples: &[Sample]) -> f32 {
+    let mut v: Vec<f32> = samples.iter().flat_map(|s| s.blocks.iter().skip(1).step_by(3 * 7).copied()).collect();
+    if v.is_empty() {
+        return 0.0;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    (v[v.len() / 2] * DARK_FRACTION).max(1e-4)
+}
+
 /// Polynomial terms uᵃvᵇ with 1 ≤ a+b ≤ DEG (no constant: F is only known
 /// up to a scale factor, fixed later by normalising the mean to 1).
 const DEG: usize = 4;
@@ -99,6 +113,7 @@ pub fn estimate(samples: &[Sample], w: usize, h: usize) -> Option<Estimate> {
     pairs.sort();
     pairs.dedup();
 
+    let dark = dark_floor(samples);
     // Observations: (term difference, log ratio) per channel.
     let mut obs: [Vec<(Vec<f64>, f64)>; 3] = Default::default();
     for &(i, j) in &pairs {
@@ -116,7 +131,7 @@ pub fn estimate(samples: &[Sample], w: usize, h: usize) -> Option<Estimate> {
                     lo = lo.min(v);
                     hi = hi.max(v);
                 }
-                if lo < 0.02 || hi / lo > 1.15 {
+                if lo < dark || hi / lo > 1.15 {
                     continue;
                 }
                 let (px, py) = ((bx as f64 + 0.5) * cw, (by as f64 + 0.5) * ch);
@@ -136,14 +151,16 @@ pub fn estimate(samples: &[Sample], w: usize, h: usize) -> Option<Estimate> {
                     let vb = (s(u0, v0) * (1.0 - tu) + s(u0 + 1, v0) * tu) * (1.0 - tv)
                         + (s(u0, v0 + 1) * (1.0 - tu) + s(u0 + 1, v0 + 1) * tu) * tv;
                     let va = at(bx, by, c);
-                    if va > 0.005 && vb > 0.005 {
+                    if va > dark * 0.25 && vb > dark * 0.25 {
                         obs[c].push((row.clone(), (va as f64 / vb as f64).ln()));
                     }
                 }
             }
         }
     }
-    if obs[1].len() < 500 {
+    // Too little usable area (e.g. a very dark sample) gives a fit that
+    // can be wildly wrong: better no flat-field than a bad one.
+    if obs[1].len() < 20_000 {
         return None;
     }
 
@@ -267,6 +284,7 @@ pub fn frame_gains(samples: &[Sample], w: usize, h: usize) -> Vec<[f32; 3]> {
     let n = samples.len();
     let (fw, fh) = (FLAT_W, FLAT_H);
     let (cw, ch) = (w as f64 / fw as f64, h as f64 / fh as f64);
+    let dark = dark_floor(samples);
     // Neighbours via a grid of frame-sized cells.
     let mut grid: std::collections::HashMap<(i64, i64), Vec<usize>> = std::collections::HashMap::new();
     let cell = |p: [f64; 2]| ((p[0] / w as f64).floor() as i64, (p[1] / h as f64).floor() as i64);
@@ -318,7 +336,7 @@ pub fn frame_gains(samples: &[Sample], w: usize, h: usize) -> Vec<[f32; 3]> {
                         lo = lo.min(v);
                         hi = hi.max(v);
                     }
-                    if lo < 0.02 || hi / lo > 1.15 {
+                    if lo < dark || hi / lo > 1.15 {
                         continue;
                     }
                     let (u0, v0) = (u as usize, v as usize);
@@ -328,7 +346,7 @@ pub fn frame_gains(samples: &[Sample], w: usize, h: usize) -> Vec<[f32; 3]> {
                         let vb = (s(u0, v0) * (1.0 - tu) + s(u0 + 1, v0) * tu) * (1.0 - tv)
                             + (s(u0, v0 + 1) * (1.0 - tu) + s(u0 + 1, v0 + 1) * tu) * tv;
                         let va = at(bx, by, c);
-                        if va > 0.005 && vb > 0.005 {
+                        if va > dark * 0.25 && vb > dark * 0.25 {
                             r[c].push((va as f64 / vb as f64).ln());
                         }
                     }

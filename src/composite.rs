@@ -283,6 +283,8 @@ impl Compositor {
     /// below, `map`: this layer → parent coordinates) where both exist.
     pub fn color_match(&self, parent: &Canvas, map: Sim) -> Option<[f32; 3]> {
         const B: usize = 16; // block size, this layer's pixels
+        // Darkness floor relative to this layer's brightness (dark samples).
+        let dark = self.levels().hi * 0.05;
         let samples: Vec<[f32; 3]> = self
             .tiles
             .par_iter()
@@ -313,7 +315,7 @@ impl Compositor {
                             }
                         }
                         // Uniform, not dark: robust to residual misalignment.
-                        if !ok || lo < 0.02 || hi / lo > 1.3 {
+                        if !ok || lo < dark || hi / lo > 1.3 {
                             continue;
                         }
                         let n = (B * B) as f32;

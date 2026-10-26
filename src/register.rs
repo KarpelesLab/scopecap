@@ -93,8 +93,32 @@ impl PhaseCorr {
         d
     }
 
-    /// Both images must be `w × h`.
+    /// Both images must be `w × h`. Returns the strongest peak.
     pub fn correlate(&self, a: &[f32], b: &[f32]) -> Match {
+        self.correlate_peaks(a, b, 1)[0]
+    }
+
+    /// Among peaks at least `min_rel` as strong as the best, the one closest
+    /// to `(ex, ey)`. On periodic structures (rows of metal lines, bump
+    /// grids) peaks one period apart are nearly equal; picking the strongest
+    /// makes tracking jump between them, picking the one consistent with
+    /// the expected motion does not.
+    pub fn correlate_near(&self, a: &[f32], b: &[f32], ex: f32, ey: f32, min_rel: f32) -> Match {
+        let peaks = self.correlate_peaks(a, b, 6);
+        let best = peaks[0].pnr;
+        *peaks
+            .iter()
+            .filter(|m| m.pnr >= best * min_rel)
+            .min_by(|p, q| {
+                let d = |m: &Match| (m.dx - ex).powi(2) + (m.dy - ey).powi(2);
+                d(p).partial_cmp(&d(q)).unwrap()
+            })
+            .unwrap()
+    }
+
+    /// The `k` strongest distinct peaks (local maxima at least 4 px apart),
+    /// strongest first; always at least one.
+    pub fn correlate_peaks(&self, a: &[f32], b: &[f32], k: usize) -> Vec<Match> {
         let (w, h) = (self.w, self.h);
         let fa = self.prepare(a);
         let fb = self.prepare(b);
@@ -108,29 +132,58 @@ impl PhaseCorr {
         let n = (w * h) as f32;
         let mean = r.iter().map(|c| c.re).sum::<f32>() / n;
         let std = (r.iter().map(|c| (c.re - mean).powi(2)).sum::<f32>() / n).sqrt().max(1e-20);
-        let mut best = (0usize, f32::MIN);
-        for (i, c) in r.iter().enumerate() {
-            if c.re > best.1 {
-                best = (i, c.re);
-            }
-        }
-        let (px, py) = (best.0 % w, best.0 / w);
         let at = |x: isize, y: isize| {
             let xx = x.rem_euclid(w as isize) as usize;
             let yy = y.rem_euclid(h as isize) as usize;
             r[yy * w + xx].re
         };
-        // Parabolic sub-pixel refinement around the peak.
+        // Candidate local maxima, strongest first, suppressing near-duplicates.
+        let mut cands: Vec<(usize, f32)> = Vec::new();
+        let floor = mean + 4.0 * std;
+        for (i, c) in r.iter().enumerate() {
+            let v = c.re;
+            if v < floor && !cands.is_empty() {
+                continue;
+            }
+            let (x, y) = ((i % w) as isize, (i / w) as isize);
+            if v >= at(x - 1, y) && v >= at(x + 1, y) && v >= at(x, y - 1) && v >= at(x, y + 1) {
+                cands.push((i, v));
+            }
+        }
+        if cands.is_empty() {
+            let i = r.iter().enumerate().max_by(|p, q| p.1.re.partial_cmp(&q.1.re).unwrap()).unwrap().0;
+            cands.push((i, r[i].re));
+        }
+        cands.sort_by(|p, q| q.1.partial_cmp(&p.1).unwrap());
+        let wrap = |p: usize, n: usize| if p > n / 2 { p as f32 - n as f32 } else { p as f32 };
+        let mut picked: Vec<(usize, f32)> = Vec::new();
+        for c in cands {
+            let (cx, cy) = (wrap(c.0 % w, w), wrap(c.0 / w, h));
+            let close = picked.iter().any(|p| {
+                let (px, py) = (wrap(p.0 % w, w), wrap(p.0 / w, h));
+                (px - cx).abs() < 4.0 && (py - cy).abs() < 4.0
+            });
+            if !close {
+                picked.push(c);
+                if picked.len() == k {
+                    break;
+                }
+            }
+        }
+        // Parabolic sub-pixel refinement around each peak.
         let sub = |m: f32, c: f32, p: f32| {
             let den = m - 2.0 * c + p;
             if den.abs() < 1e-12 { 0.0 } else { (0.5 * (m - p) / den).clamp(-0.5, 0.5) }
         };
-        let (pxi, pyi) = (px as isize, py as isize);
-        let c = at(pxi, pyi);
-        let fx = sub(at(pxi - 1, pyi), c, at(pxi + 1, pyi));
-        let fy = sub(at(pxi, pyi - 1), c, at(pxi, pyi + 1));
-        let wrap = |p: usize, n: usize| if p > n / 2 { p as f32 - n as f32 } else { p as f32 };
-        Match { dx: wrap(px, w) + fx, dy: wrap(py, h) + fy, pnr: (c - mean) / std }
+        picked
+            .into_iter()
+            .map(|(i, c)| {
+                let (px, py) = ((i % w) as isize, (i / w) as isize);
+                let fx = sub(at(px - 1, py), c, at(px + 1, py));
+                let fy = sub(at(px, py - 1), c, at(px, py + 1));
+                Match { dx: wrap(i % w, w) + fx, dy: wrap(i / w, h) + fy, pnr: (c - mean) / std }
+            })
+            .collect()
     }
 }
 
@@ -160,6 +213,20 @@ mod tests {
             }
         }
         v
+    }
+
+    /// Stripes repeat every 12 px: the strongest peak may be any period, but
+    /// asking for the one nearest the expected shift gives the true one.
+    #[test]
+    fn periodic_prefers_expected() {
+        let (w, h) = (160, 120);
+        let stripes = |ox: f32| -> Vec<f32> {
+            let tex = pattern(w, h, ox, 0.0);
+            (0..w * h).map(|i| ((((i % w) as f32 - ox) * std::f32::consts::TAU / 12.0).sin() * 2.0 + tex[i] * 0.05)).collect()
+        };
+        let pc = PhaseCorr::new(w, h, 0.15);
+        let m = pc.correlate_near(&stripes(0.0), &stripes(3.0), 3.0, 0.0, 0.8);
+        assert!((m.dx - 3.0).abs() < 0.6, "{m:?}");
     }
 
     #[test]

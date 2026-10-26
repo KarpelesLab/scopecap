@@ -153,7 +153,10 @@ impl Reference {
             }
         }
         let pc = self.pcs.entry((rw, rh, true)).or_insert_with(|| PhaseCorr::new(rw, rh, LOWPASS));
-        let m = pc.correlate(&a, &b);
+        // Narrow searches check an expected position: among near-equal peaks
+        // (periodic structures) take the one agreeing with it. Wide searches
+        // look for the best match anywhere.
+        let m = if radius <= 0.5 { pc.correlate_near(&a, &b, 0.0, 0.0, 0.8) } else { pc.correlate(&a, &b) };
         let debug = std::env::var_os("SCOPECAP_DEBUG_REF").is_some();
         if m.pnr < MIN_PNR {
             if debug {

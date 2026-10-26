@@ -5,6 +5,7 @@
 //! magnification, each registered onto the one below, and written as one
 //! stacked, zoomable viewer.
 
+use crate::align;
 use crate::autoflat;
 use crate::config::{self, Settings};
 use crate::mosaic::{self, Mosaic, Track};
@@ -41,13 +42,15 @@ pub struct Opts {
     pub no_join: bool,
     /// Per-frame brightness/colour correction.
     pub gains: bool,
+    /// Global alignment of each layer's frames.
+    pub align: bool,
 }
 
-const USAGE: &str = "usage: scopecap render <scan-or-project-dir> [--flat auto|live|none] [--max-speed PX] [--out DIR] [--install-flat] [--no-gains] [--no-join]";
+const USAGE: &str = "usage: scopecap render <scan-or-project-dir> [--flat auto|live|none] [--max-speed PX] [--out DIR] [--install-flat] [--no-gains] [--no-align] [--no-join]";
 
 pub fn main(args: &[String]) -> Result<()> {
     let mut dir = None;
-    let mut o = Opts { flat: FlatMode::Auto, max_speed: 2.0, out: None, install_flat: false, no_join: false, gains: true };
+    let mut o = Opts { flat: FlatMode::Auto, max_speed: 2.0, out: None, install_flat: false, no_join: false, gains: true, align: true };
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -64,6 +67,7 @@ pub fn main(args: &[String]) -> Result<()> {
             "--install-flat" => o.install_flat = true,
             "--no-join" => o.no_join = true,
             "--no-gains" => o.gains = false,
+            "--no-align" => o.align = false,
             s if !s.starts_with('-') && dir.is_none() => dir = Some(PathBuf::from(s)),
             _ => bail!("{USAGE}"),
         }
@@ -207,9 +211,13 @@ fn run_project(dir: &Path, o: &Opts) -> Result<()> {
         }
         // Colour/brightness matched to the layer below.
         if let (Some(((pc, _), _)), Some(m)) = (&parent, map) {
-            if let Some(g) = r.pieces[0].color_match(pc, m) {
-                println!("   colour matched to the layer below: R×{:.3} G×{:.3} B×{:.3}", g[0], g[1], g[2]);
-                r.pieces[0].gain = g;
+            match r.pieces[0].color_match(pc, m) {
+                Some(g) if g.iter().all(|v| (0.25..=4.0).contains(v)) => {
+                    println!("   colour matched to the layer below: R×{:.3} G×{:.3} B×{:.3}", g[0], g[1], g[2]);
+                    r.pieces[0].gain = g;
+                }
+                Some(g) => println!("   colour match implausible (R×{:.3} G×{:.3} B×{:.3}); not applied", g[0], g[1], g[2]),
+                None => println!("   colour match: not enough comparable area; not applied"),
             }
         }
         let lv = *levels.get_or_insert_with(|| r.pieces[0].levels());
@@ -297,6 +305,10 @@ fn render_layer(sessions: &[Session], o: &Opts, out: &Path, make_ref: impl Fn() 
     let still: Vec<usize> = (0..used.len()).filter(|&i| used[i].still).collect();
     println!("   using {} still frames and {} taken while moving (hole filling)", still.len(), used.len() - still.len());
 
+    if o.align && still.len() >= 2 {
+        global_align(sessions, &mut used, &still, &corr, w, h);
+    }
+
     let flat: Option<Flat> = match o.flat {
         FlatMode::None => None,
         FlatMode::Live => {
@@ -339,15 +351,30 @@ fn render_layer(sessions: &[Session], o: &Opts, out: &Path, make_ref: impl Fn() 
         let stills: Vec<&Used> = still.iter().map(|&i| &used[i]).collect();
         let gains = solve_gains(&stills, corr.flat.as_deref(), w, h);
         let spread = gains.iter().map(|g| g[1]).fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(v), b.max(v)));
-        println!(
+        if !gains.is_empty() {
+            println!(
             "   per-frame light correction for {} frames: gains {:.2}–{:.2} ({:.1}s)",
             gains.len(),
             spread.0,
             spread.1,
             t0.elapsed().as_secs_f32()
         );
+        }
         for (&i, g) in still.iter().zip(gains) {
             used[i].gain = g;
+        }
+    }
+
+    // Final positions, for debugging (after global alignment).
+    {
+        use std::io::Write;
+        let mut f = std::io::BufWriter::new(std::fs::File::create(out.join("positions.jsonl"))?);
+        for u in &used {
+            writeln!(
+                f,
+                "{}",
+                serde_json::json!({ "session": u.session, "seq": u.frame.seq, "x": u.pos[0], "y": u.pos[1], "still": u.still, "high": u.high, "group": u.group })
+            )?;
         }
     }
 
@@ -663,6 +690,67 @@ fn track(
     Ok(PassResult { positions, states, decode_fail, merges: m.merges().to_vec(), map: m.layer_map(), islands: m.islands() })
 }
 
+/// Make the layer self-consistent: register overlapping still frames
+/// pairwise and solve all positions together (see align.rs). Moving frames
+/// get the correction of the nearest still frame.
+fn global_align(sessions: &[Session], used: &mut [Used], still: &[usize], corr: &Correction, w: usize, h: usize) {
+    let t0 = Instant::now();
+    // (index into `used`, frame) for the still frames that decoded.
+    let mut sub: Vec<align::AlignFrame> = Vec::with_capacity(still.len());
+    let mut sub_idx: Vec<usize> = Vec::with_capacity(still.len());
+    for (si, sess) in sessions.iter().enumerate() {
+        let mine: Vec<usize> = still.iter().copied().filter(|&i| used[i].session == si).collect();
+        for chunk in mine.chunks(256) {
+            let recs: Vec<FrameRec> = chunk.iter().map(|&i| used[i].frame.clone()).collect();
+            let imgs: Vec<Option<Vec<f32>>> = decode_batch(&sess.stream, &recs, w, h)
+                .into_par_iter()
+                .map(|img| {
+                    let mut img = img?;
+                    proc::apply_correction(&mut img, corr);
+                    Some(mosaic::downsample(&mosaic::green(&img), w, h, align::DIV).0)
+                })
+                .collect();
+            for (&i, img) in chunk.iter().zip(imgs) {
+                if let Some(img) = img {
+                    sub_idx.push(i);
+                    sub.push(align::AlignFrame { group: used[i].group, pos: used[i].pos, img });
+                }
+            }
+        }
+    }
+    let r = align::align(&mut sub, w, h);
+    let mut delta: HashMap<usize, [f64; 2]> = HashMap::new();
+    for (f, &i) in sub.iter().zip(&sub_idx) {
+        delta.insert(i, [f.pos[0] - used[i].pos[0], f.pos[1] - used[i].pos[1]]);
+        used[i].pos = f.pos;
+    }
+    // Moving frames: shift like the nearest still frame (in recording order).
+    let mut last: Option<[f64; 2]> = None;
+    let mut pending: Vec<usize> = Vec::new();
+    for i in 0..used.len() {
+        if let Some(d) = delta.get(&i) {
+            for &k in &pending {
+                used[k].pos = [used[k].pos[0] + d[0], used[k].pos[1] + d[1]];
+            }
+            pending.clear();
+            last = Some(*d);
+        } else if !used[i].still {
+            match last {
+                Some(d) => used[i].pos = [used[i].pos[0] + d[0], used[i].pos[1] + d[1]],
+                None => pending.push(i),
+            }
+        }
+    }
+    println!(
+        "   global alignment: {} frame pairs, {} consistent; frames moved by {:.1} px median, {:.0} px max ({:.1}s)",
+        r.pairs,
+        r.kept,
+        r.moved_median,
+        r.moved_max,
+        t0.elapsed().as_secs_f32()
+    );
+}
+
 /// Per-frame gains from the placed frames' (flat-corrected) block means.
 fn solve_gains(used: &[&Used], flat: Option<&Flat>, w: usize, h: usize) -> Vec<[f32; 3]> {
     let samples: Vec<autoflat::Sample> = used
@@ -705,7 +793,7 @@ fn auto_flat(used: &[&Used], w: usize, h: usize, gains: Option<&[[f32; 3]]>) -> 
         return None;
     }
     let t0 = Instant::now();
-    match autoflat::estimate(&samples, w, h) {
+    match autoflat::estimate(&samples, w, h).filter(|e| e.flat.falloff() >= 0.15) {
         Some(e) => {
             println!(
                 "   auto flat-field from {} frames: {} pairs, {} observations, fit residual {:.1}% ({:.1}s)",
@@ -718,7 +806,7 @@ fn auto_flat(used: &[&Used], w: usize, h: usize, gains: Option<&[[f32; 3]]>) -> 
             Some(e.flat)
         }
         None => {
-            println!("   auto flat-field: not enough overlapping frames; rendering without one");
+            println!("   auto flat-field: no reliable estimate (too little overlap or usable area); rendering without one");
             None
         }
     }
