@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>scopecap mosaic</title>
+<style>
+  :root { --bg: #141414; --panel: rgba(30,30,30,.85); --fg: #ddd; --muted: #999; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+    font: 13px/1.4 system-ui, sans-serif; overflow: hidden; }
+  #view { position: absolute; inset: 0; cursor: grab; touch-action: none; }
+  #view.drag { cursor: grabbing; }
+  #view img { position: absolute; transform-origin: 0 0; user-select: none; -webkit-user-drag: none; }
+  #view.pixelated img { image-rendering: pixelated; }
+  #hud { position: absolute; left: 12px; bottom: 12px; background: var(--panel); padding: 6px 10px;
+    border-radius: 6px; pointer-events: none; font-variant-numeric: tabular-nums; }
+  #bar { position: absolute; right: 12px; top: 12px; display: flex; gap: 6px; }
+  #bar button { background: var(--panel); color: var(--fg); border: 1px solid #444; border-radius: 6px;
+    padding: 6px 10px; font: inherit; cursor: pointer; }
+  #bar button:hover { border-color: #888; }
+  #help { color: var(--muted); }
+</style>
+</head>
+<body>
+<div id="view"></div>
+<div id="bar">
+  <button id="zin" title="Zoom in (+)">+</button>
+  <button id="zout" title="Zoom out (−)">−</button>
+  <button id="fit" title="Fit (0)">Fit</button>
+  <button id="one" title="Actual pixels (1)">1:1</button>
+  <button id="pix" title="Toggle smooth/pixelated (p)">Smooth</button>
+</div>
+<div id="hud"><span id="info"></span> <span id="help">· drag to pan · wheel to zoom</span></div>
+<script src="project.js" onerror="this.remove()"></script>
+<script src="mosaic.js" onerror="this.remove()"></script>
+<script>
+"use strict";
+const view = document.getElementById("view");
+const info = document.getElementById("info");
+const bar = document.getElementById("bar");
+let layers;         // [{name, scale, offset, dir, m (manifest), present, on}]
+let scale = 1, ox = 0, oy = 0;   // screen px per project px, screen pos of project origin
+let mouse = null;
+const imgs = new Map();
+
+// A project's layers each ship their own mosaic.js setting window.MOSAIC;
+// load them one at a time (fetch() is blocked on file:// pages).
+function loadScript(src) {
+  return new Promise((ok, err) => {
+    const s = document.createElement("script");
+    s.src = src; s.onload = ok; s.onerror = err;
+    document.head.appendChild(s);
+  });
+}
+
+async function init() {
+  if (window.PROJECT) {
+    layers = [];
+    for (const l of window.PROJECT.layers) {
+      window.MOSAIC = undefined;
+      try { await loadScript(l.dir + "/mosaic.js"); } catch (e) { continue; }
+      layers.push({ ...l, m: window.MOSAIC });
+    }
+    document.title = (window.PROJECT.name || "scopecap") + " — project";
+  } else {
+    layers = [{ name: "", scale: 1, offset: [0, 0], dir: ".", m: window.MOSAIC }];
+  }
+  for (const L of layers) {
+    L.present = L.m.tiles.map(list => new Set(list));
+    L.origin = L.m.origin || [0, 0];
+    L.on = true;
+  }
+  if (layers.length > 1) {
+    for (const L of layers) {
+      const b = document.createElement("button");
+      b.textContent = L.name;
+      b.title = "Show/hide this layer";
+      b.onclick = () => { L.on = !L.on; b.style.opacity = L.on ? 1 : 0.4; render(); };
+      bar.insertBefore(b, bar.firstChild);
+    }
+  }
+  fit();
+}
+
+function extent() {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const L of layers) {
+    const ax = L.offset[0] + L.scale * L.origin[0], ay = L.offset[1] + L.scale * L.origin[1];
+    x0 = Math.min(x0, ax); y0 = Math.min(y0, ay);
+    x1 = Math.max(x1, ax + L.scale * L.m.width); y1 = Math.max(y1, ay + L.scale * L.m.height);
+  }
+  return [x0, y0, x1, y1];
+}
+
+function fit() {
+  const [x0, y0, x1, y1] = extent();
+  const w = view.clientWidth, h = view.clientHeight;
+  scale = Math.min(w / (x1 - x0), h / (y1 - y0)) * 0.95;
+  ox = (w - (x1 - x0) * scale) / 2 - x0 * scale;
+  oy = (h - (y1 - y0) * scale) / 2 - y0 * scale;
+  render();
+}
+
+function zoomAt(f, sx, sy) {
+  const ns = Math.min(Math.max(scale * f, 1e-5), 256);
+  ox = sx - (sx - ox) * ns / scale;
+  oy = sy - (sy - oy) * ns / scale;
+  scale = ns;
+  render();
+}
+
+function render() {
+  const W = view.clientWidth, H = view.clientHeight;
+  const want = new Set();
+  let detail = "";
+  layers.forEach((L, li) => {
+    if (!L.on) return;
+    const TS = L.m.tileSize, top = L.m.levels - 1;
+    const eff = scale * L.scale;             // screen px per layer px
+    const z = Math.max(0, Math.min(top, Math.floor(Math.log2(1 / eff))));
+    if (eff > 0.25) detail = L.name ? `${L.name} level ${z}` : `level ${z}`;
+    // Screen position of layer point (lx, ly).
+    const sx = lx => ox + scale * (L.offset[0] + L.scale * (L.origin[0] + lx));
+    const sy = ly => oy + scale * (L.offset[1] + L.scale * (L.origin[1] + ly));
+    for (const lv of z === top ? [top] : [top, z]) {
+      const span = TS * 2 ** lv, size = span * eff;
+      const x0 = Math.max(0, Math.floor((0 - sx(0)) / size)), y0 = Math.max(0, Math.floor((0 - sy(0)) / size));
+      const x1 = Math.floor((W - sx(0)) / size), y1 = Math.floor((H - sy(0)) / size);
+      for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+        const k = x + "_" + y;
+        if (!L.present[lv].has(k)) continue;
+        const key = li + ":" + lv + "/" + k;
+        want.add(key);
+        let im = imgs.get(key);
+        if (!im) {
+          im = new Image();
+          im.src = L.dir + "/tiles/" + lv + "/" + k + ".png";
+          im.width = TS; im.height = TS;
+          im.style.zIndex = String(li * 100 + top - lv);
+          imgs.set(key, im);
+          view.appendChild(im);
+        }
+        im.style.transform = `translate(${sx(x * span)}px, ${sy(y * span)}px) scale(${size / TS})`;
+      }
+    }
+  });
+  for (const [key, im] of imgs) if (!want.has(key)) { im.remove(); imgs.delete(key); }
+  let txt = `zoom ${(scale * 100).toPrecision(3)}%` + (detail ? ` · ${detail}` : "");
+  if (mouse) txt += ` · x ${((mouse[0] - ox) / scale).toFixed(0)} y ${((mouse[1] - oy) / scale).toFixed(0)}`;
+  info.textContent = txt;
+}
+
+let drag = null;
+const pointers = new Map();
+view.addEventListener("pointerdown", e => {
+  view.setPointerCapture(e.pointerId);
+  pointers.set(e.pointerId, [e.clientX, e.clientY]);
+  drag = [e.clientX, e.clientY];
+  view.classList.add("drag");
+});
+view.addEventListener("pointermove", e => {
+  mouse = [e.clientX, e.clientY];
+  if (pointers.size === 2 && pointers.has(e.pointerId)) {
+    // Pinch zoom.
+    const [a, b] = [...pointers.values()];
+    const d0 = Math.hypot(a[0] - b[0], a[1] - b[1]);
+    pointers.set(e.pointerId, [e.clientX, e.clientY]);
+    const [c, d] = [...pointers.values()];
+    const d1 = Math.hypot(c[0] - d[0], c[1] - d[1]);
+    if (d0 > 0) zoomAt(d1 / d0, (c[0] + d[0]) / 2, (c[1] + d[1]) / 2);
+    return;
+  }
+  if (drag && pointers.has(e.pointerId)) {
+    ox += e.clientX - drag[0];
+    oy += e.clientY - drag[1];
+    drag = [e.clientX, e.clientY];
+    pointers.set(e.pointerId, drag);
+  }
+  if (layers) render();
+});
+const up = e => {
+  pointers.delete(e.pointerId);
+  drag = pointers.size ? [...pointers.values()][0] : null;
+  if (!drag) view.classList.remove("drag");
+};
+view.addEventListener("pointerup", up);
+view.addEventListener("pointercancel", up);
+view.addEventListener("wheel", e => {
+  e.preventDefault();
+  zoomAt(Math.exp(-e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0015)), e.clientX, e.clientY);
+}, { passive: false });
+view.addEventListener("dblclick", e => zoomAt(2, e.clientX, e.clientY));
+
+const center = () => [view.clientWidth / 2, view.clientHeight / 2];
+// 1:1 = one screen pixel per pixel of the most detailed visible layer.
+const actual = () => zoomAt(1 / (scale * Math.min(...layers.filter(L => L.on).map(L => L.scale))), ...center());
+document.getElementById("zin").onclick = () => zoomAt(1.5, ...center());
+document.getElementById("zout").onclick = () => zoomAt(1 / 1.5, ...center());
+document.getElementById("fit").onclick = fit;
+document.getElementById("one").onclick = actual;
+const pix = document.getElementById("pix");
+pix.onclick = () => {
+  view.classList.toggle("pixelated");
+  pix.textContent = view.classList.contains("pixelated") ? "Pixelated" : "Smooth";
+};
+addEventListener("keydown", e => {
+  if (e.key === "+" || e.key === "=") zoomAt(1.5, ...center());
+  else if (e.key === "-") zoomAt(1 / 1.5, ...center());
+  else if (e.key === "0") fit();
+  else if (e.key === "1") actual();
+  else if (e.key === "p") pix.click();
+});
+addEventListener("resize", () => layers && render());
+init();
+</script>
+</body>
+</html>
