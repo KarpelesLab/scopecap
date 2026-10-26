@@ -742,6 +742,11 @@ impl Mosaic {
         self.last_conf
     }
 
+    /// Scale measurements the reference mapping is based on.
+    pub fn scale_samples(&self) -> usize {
+        self.reference.as_ref().map_or(0, |r| r.scale_samples())
+    }
+
     /// Mapping of this layer onto the reference layer, once calibrated.
     pub fn layer_map(&self) -> Option<Sim> {
         self.reference.as_ref().and_then(|r| r.map)
@@ -803,6 +808,29 @@ impl Mosaic {
                         None => {
                             // Not found on the map (yet): keep trying.
                             self.calib_wait = 10;
+                            self.track = Track::Lost;
+                            return (Vec::new(), 0.0, 0.0);
+                        }
+                    }
+                } else if r.frozen {
+                    // A segment of a layer tracked in parallel: the mapping
+                    // is shared, so the first frame is located on the lower
+                    // layer rather than becoming the origin.
+                    if self.calib_wait > 0 {
+                        self.calib_wait -= 1;
+                        self.track = Track::Lost;
+                        return (Vec::new(), 0.0, 0.0);
+                    }
+                    let map = r.map.unwrap();
+                    match r.find(&g, w, h) {
+                        Some(q) => {
+                            self.pos = map.invert(q);
+                            self.track = Track::Ok;
+                            let touched = self.paste(f, &g, CONF_HIGH);
+                            return (touched, 0.0, 0.0);
+                        }
+                        None => {
+                            self.calib_wait = 5;
                             self.track = Track::Lost;
                             return (Vec::new(), 0.0, 0.0);
                         }

@@ -18,6 +18,7 @@ use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -248,23 +249,30 @@ const MIN_PIECE_FRAMES: usize = 10;
 /// One layer: track every frame (positions, confidence), estimate the
 /// flat-field and per-frame gains, then composite with focus weighting.
 /// Writes trace.jsonl and flat.bin into `out`.
-fn render_layer(sessions: &[Session], o: &Opts, out: &Path, make_ref: impl Fn() -> Option<Reference>) -> Result<LayerResult> {
+fn render_layer(sessions: &[Session], o: &Opts, out: &Path, make_ref: impl Fn() -> Option<Reference> + Sync) -> Result<LayerResult> {
     std::fs::create_dir_all(out)?;
     let s0 = &sessions[0];
     let (w, h) = (s0.info.width as usize, s0.info.height as usize);
     let mut corr = Correction { wb: s0.settings.wb, flat: None, use_flat: true, levels: s0.settings.levels, peaking: false };
 
     println!("   tracking");
-    let tracked = pass(sessions, &corr, o, w, h, make_ref(), Some(&out.join("trace.jsonl")))?;
+    let t0 = Instant::now();
+    let tracked = pass(sessions, &corr, o, w, h, &make_ref, Some(&out.join("trace.jsonl")))?;
     let total: usize = sessions.iter().map(|s| s.frames.len()).sum();
-    println!("   tracking: {:?}, {} undecodable, {} piece(s)", tracked.states, tracked.decode_fail, tracked.mosaic.islands());
+    println!(
+        "   tracking: {:?}, {} undecodable, {} piece(s) ({:.0}s)",
+        tracked.states,
+        tracked.decode_fail,
+        tracked.islands,
+        t0.elapsed().as_secs_f32()
+    );
     if tracked.states.get(&format!("{:?}", Track::Lost)).copied().unwrap_or(0) > total / 4 {
         println!("   warning: tracking was lost for many frames — parts of the scan may be missing");
     }
     // Usable frames, positions resolved through merges: those placed while
     // still, plus frames taken while moving moderately, which only fill
     // spots nothing still covers (low weight, unverified position).
-    let merges = tracked.mosaic.merges().to_vec();
+    let merges = tracked.merges.clone();
     let mut used: Vec<Used> = tracked
         .positions
         .into_iter()
@@ -362,7 +370,7 @@ fn render_layer(sessions: &[Session], o: &Opts, out: &Path, make_ref: impl Fn() 
         let mut done = 0usize;
         for (si, sess) in sessions.iter().enumerate() {
             let mine: Vec<&Used> = used.iter().filter(|u| u.session == si && index.contains_key(&u.group)).collect();
-            for chunk in mine.chunks(64) {
+            for chunk in mine.chunks(256) {
                 let recs: Vec<FrameRec> = chunk.iter().map(|u| u.frame.clone()).collect();
                 let placed: Vec<(usize, Placed)> = decode_batch(&sess.stream, &recs, w, h)
                     .into_par_iter()
@@ -402,7 +410,7 @@ fn render_layer(sessions: &[Session], o: &Opts, out: &Path, make_ref: impl Fn() 
         }
         println!("     {} frames in {:.1}s", done, t0.elapsed().as_secs_f32());
     }
-    Ok(LayerResult { pieces, map: tracked.mosaic.layer_map(), states: tracked.states })
+    Ok(LayerResult { pieces, map: tracked.map, states: tracked.states })
 }
 
 /// A frame chosen for compositing.
@@ -424,6 +432,8 @@ const MOVING_MAX: f32 = 4.0;
 const MOVING_WEIGHT: f32 = 0.05;
 
 struct FramePos {
+    /// Position of the frame in the whole layer (all sessions).
+    index: usize,
     session: usize,
     frame: FrameRec,
     island: u32,
@@ -434,93 +444,223 @@ struct FramePos {
     /// Block means (FLAT grid) of frames that were placed, for the
     /// flat-field and gain estimation.
     blocks: Option<Vec<f32>>,
+    /// The frame's trace.jsonl record.
+    trace: serde_json::Value,
 }
 
 struct PassResult {
-    mosaic: Mosaic,
     positions: Vec<FramePos>,
     states: BTreeMap<String, usize>,
     decode_fail: usize,
+    /// Island merges (layers without a reference only).
+    merges: Vec<mosaic::Merge>,
+    /// Mapping onto the reference layer, if any.
+    map: Option<Sim>,
+    islands: usize,
 }
 
-/// Run every frame of every session through the tracking engine in order.
+/// The sequential calibration run stops after this many scale measurements
+/// (median: ~0.05% precision) or this many frames.
+const CALIBRATION_SAMPLES: usize = 40;
+const CALIBRATION_FRAMES: usize = 2000;
+/// Minimum frames per parallel segment.
+const SEGMENT_MIN: usize = 300;
+/// Each segment starts this many frames early, so it has locked on by the
+/// time its own frames begin (the warm-up results are discarded).
+const SEGMENT_WARMUP: usize = 150;
+
+/// Track every frame of every session. Layers registered onto a lower layer
+/// are split into segments tracked in parallel: each frame can be placed
+/// absolutely on the lower layer, so segments don't depend on each other.
+/// A sequential run over the first frames measures the mapping first, which
+/// all segments then share (frozen), so their positions agree.
 fn pass(
     sessions: &[Session],
     corr: &Correction,
     o: &Opts,
     w: usize,
     h: usize,
-    reference: Option<Reference>,
+    make_ref: &(dyn Fn() -> Option<Reference> + Sync),
     trace: Option<&Path>,
 ) -> Result<PassResult> {
-    use std::io::Write;
+    let all: Vec<(usize, FrameRec, usize)> = sessions
+        .iter()
+        .enumerate()
+        .flat_map(|(si, s)| s.frames.iter().map(move |f| (si, f.clone())))
+        .enumerate()
+        .map(|(i, (si, f))| (si, f, i))
+        .collect();
+    let progress = Progress { done: AtomicUsize::new(0), total: all.len(), t0: Instant::now() };
+    let threads = rayon::current_num_threads();
+    let segments = (all.len() / SEGMENT_MIN).min(threads / 6).max(1);
+    let r = match make_ref() {
+        Some(r) if segments >= 2 => {
+            let cal = track(sessions, &all[..all.len().min(CALIBRATION_FRAMES)], corr, o, w, h, Some(r), Some(&progress), true)?;
+            match cal.map {
+                Some(map) => {
+                    // The calibration run's frames are kept; the rest is split.
+                    let consumed = cal.positions.last().map_or(0, |f| f.index + 1).max(cal.positions.len() + cal.decode_fail);
+                    let rest = &all[consumed..];
+                    let size = rest.len().div_ceil(segments).max(1);
+                    println!(
+                        "     mapping {:.5} ({:.1}, {:.1}) from {} frames; tracking the remaining {} in {} parallel segments",
+                        map.s,
+                        map.tx,
+                        map.ty,
+                        consumed,
+                        rest.len(),
+                        rest.len().div_ceil(size)
+                    );
+                    let starts: Vec<usize> = (consumed..all.len()).step_by(size).collect();
+                    let parts: Vec<Result<PassResult>> = starts
+                        .par_iter()
+                        .map(|&start| {
+                            let end = (start + size).min(all.len());
+                            let warm = start.saturating_sub(SEGMENT_WARMUP).max(consumed.min(start));
+                            let mut r = make_ref().unwrap();
+                            r.map = Some(map);
+                            r.frozen = true;
+                            let mut p = track(sessions, &all[warm..end], corr, o, w, h, Some(r), None, false)?;
+                            // Drop the warm-up frames: the previous segment has them.
+                            p.positions.retain(|f| f.index >= start);
+                            p.states = BTreeMap::new();
+                            for f in &p.positions {
+                                *p.states.entry(format!("{:?}", f.state)).or_default() += 1;
+                            }
+                            progress.tick(end - start);
+                            Ok(p)
+                        })
+                        .collect();
+                    let mut out = cal;
+                    out.map = Some(map);
+                    for p in parts {
+                        let p = p?;
+                        out.positions.extend(p.positions);
+                        for (k, v) in p.states {
+                            *out.states.entry(k).or_default() += v;
+                        }
+                        out.decode_fail += p.decode_fail;
+                    }
+                    out
+                }
+                // Couldn't calibrate early on: track it all sequentially.
+                None => track(sessions, &all, corr, o, w, h, make_ref(), Some(&progress), false)?,
+            }
+        }
+        r => track(sessions, &all, corr, o, w, h, r, Some(&progress), false)?,
+    };
+    if let Some(path) = trace {
+        use std::io::Write;
+        let mut t = std::io::BufWriter::new(std::fs::File::create(path)?);
+        for p in &r.positions {
+            writeln!(t, "{}", p.trace)?;
+        }
+    }
+    Ok(r)
+}
+
+struct Progress {
+    done: AtomicUsize,
+    total: usize,
+    t0: Instant,
+}
+
+impl Progress {
+    fn tick(&self, n: usize) {
+        let before = self.done.fetch_add(n, Ordering::Relaxed);
+        if before / 2000 != (before + n) / 2000 {
+            let done = before + n;
+            println!("     {}/{} frames ({:.0} fps)", done, self.total, done as f64 / self.t0.elapsed().as_secs_f64());
+        }
+    }
+}
+
+/// Track a run of frames, in order, with one engine.
+#[allow(clippy::too_many_arguments)]
+fn track(
+    sessions: &[Session],
+    frames: &[(usize, FrameRec, usize)],
+    corr: &Correction,
+    o: &Opts,
+    w: usize,
+    h: usize,
+    reference: Option<Reference>,
+    progress: Option<&Progress>,
+    // Stop once the layer mapping is well measured (calibration run).
+    calibrate: bool,
+) -> Result<PassResult> {
     let mut reference = reference;
     let mut mosaic: Option<Mosaic> = None;
     let mut positions = Vec::new();
     let mut states: BTreeMap<String, usize> = BTreeMap::new();
     let mut decode_fail = 0;
-    let t0 = Instant::now();
-    let mut n = 0usize;
-    let total: usize = sessions.iter().map(|s| s.frames.len()).sum();
-    let mut trace = match trace {
-        Some(p) => Some(std::io::BufWriter::new(std::fs::File::create(p)?)),
-        None => None,
-    };
-    for (si, sess) in sessions.iter().enumerate() {
-        if let Some(m) = &mut mosaic {
-            m.resume();
+    let mut last_session = None;
+    // Consecutive runs of the same session, decoded in batches.
+    let mut i = 0;
+    'frames: while i < frames.len() {
+        let si = frames[i].0;
+        let mut j = i;
+        while j < frames.len() && j - i < 64 && frames[j].0 == si {
+            j += 1;
         }
-        for (bi, batch) in sess.frames.chunks(128).enumerate() {
-            for (fr, img) in batch.iter().zip(decode_batch(&sess.stream, batch, w, h)) {
-                n += 1;
-                let Some(mut img) = img else {
-                    decode_fail += 1;
-                    continue;
-                };
-                proc::apply_correction(&mut img, corr);
-                let m = mosaic.get_or_insert_with(|| {
-                    let lv = corr.levels.unwrap_or_else(|| proc::auto_levels(&img));
-                    let mut m = Mosaic::new(lv, o.max_speed);
-                    m.join = !o.no_join;
-                    m.reference = reference.take();
-                    m
-                });
-                let (touched, pnr, speed) = m.process(&img);
-                let events = m.take_events();
-                for e in &events {
-                    println!("     frame {}: {e}", fr.seq);
-                }
-                let placed = m.track == Track::Ok && !touched.is_empty();
-                positions.push(FramePos {
-                    session: si,
-                    frame: fr.clone(),
-                    island: m.island_id(),
-                    pos: m.pos,
-                    state: if placed { Track::Ok } else { m.track },
-                    high: m.last_conf() == mosaic::CONF_HIGH,
-                    speed,
-                    blocks: placed.then(|| proc::block_means(&img, proc::FLAT_W, proc::FLAT_H)),
-                });
-                if let Some(t) = &mut trace {
-                    writeln!(
-                        t,
-                        "{}",
-                        serde_json::json!({
-                            "session": si, "seq": fr.seq, "state": format!("{:?}", m.track), "x": m.pos[0], "y": m.pos[1],
-                            "island": m.island_id(), "pnr": pnr, "speed": speed, "pasted": placed,
-                            "pieces": m.islands(), "events": events,
-                        })
-                    )?;
-                }
-                *states.entry(format!("{:?}", m.track)).or_default() += 1;
-            }
-            if bi % 16 == 15 {
-                println!("     {}/{} frames ({:.0} fps) {:?}", n, total, n as f64 / t0.elapsed().as_secs_f64(), states);
+        if last_session.is_some_and(|l| l != si) {
+            if let Some(m) = &mut mosaic {
+                m.resume();
             }
         }
+        last_session = Some(si);
+        let recs: Vec<FrameRec> = frames[i..j].iter().map(|f| f.1.clone()).collect();
+        for ((fr, img), &(_, _, index)) in recs.iter().zip(decode_batch(&sessions[si].stream, &recs, w, h)).zip(&frames[i..j]) {
+            let Some(mut img) = img else {
+                decode_fail += 1;
+                continue;
+            };
+            proc::apply_correction(&mut img, corr);
+            let m = mosaic.get_or_insert_with(|| {
+                let lv = corr.levels.unwrap_or_else(|| proc::auto_levels(&img));
+                let mut m = Mosaic::new(lv, o.max_speed);
+                m.join = !o.no_join;
+                m.reference = reference.take();
+                m
+            });
+            let (touched, pnr, speed) = m.process(&img);
+            let events = m.take_events();
+            for e in &events {
+                println!("     frame {}: {e}", fr.seq);
+            }
+            let placed = m.track == Track::Ok && !touched.is_empty();
+            let trace = serde_json::json!({
+                "session": si, "seq": fr.seq, "state": format!("{:?}", m.track), "x": m.pos[0], "y": m.pos[1],
+                "island": m.island_id(), "pnr": pnr, "speed": speed, "pasted": placed,
+                "pieces": m.islands(), "events": events,
+            });
+            positions.push(FramePos {
+                index,
+                session: si,
+                frame: fr.clone(),
+                island: m.island_id(),
+                pos: m.pos,
+                state: if placed { Track::Ok } else { m.track },
+                high: m.last_conf() == mosaic::CONF_HIGH,
+                speed,
+                blocks: placed.then(|| proc::block_means(&img, proc::FLAT_W, proc::FLAT_H)),
+                trace,
+            });
+            *states.entry(format!("{:?}", m.track)).or_default() += 1;
+            if calibrate && m.scale_samples() >= CALIBRATION_SAMPLES {
+                if let Some(p) = progress {
+                    p.tick(positions.len() + decode_fail - i);
+                }
+                break 'frames;
+            }
+        }
+        if let Some(p) = progress {
+            p.tick(j - i);
+        }
+        i = j;
     }
-    let Some(mosaic) = mosaic else { bail!("no decodable frames") };
-    Ok(PassResult { mosaic, positions, states, decode_fail })
+    let Some(m) = mosaic else { bail!("no decodable frames") };
+    Ok(PassResult { positions, states, decode_fail, merges: m.merges().to_vec(), map: m.layer_map(), islands: m.islands() })
 }
 
 /// Per-frame gains from the placed frames' (flat-corrected) block means.

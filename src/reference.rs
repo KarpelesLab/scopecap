@@ -51,6 +51,8 @@ pub struct Reference {
     scales: Vec<f64>,
     pcs: HashMap<(usize, usize, bool), PhaseCorr>,
     failed: u32,
+    /// Mapping fixed (shared by segments tracked in parallel): no learning.
+    pub frozen: bool,
 }
 
 /// Area-average resample of a w×h image by factor `s` (< 1), via an
@@ -116,7 +118,7 @@ fn ncc(a: &[f32], b: &[f32]) -> f32 {
 
 impl Reference {
     pub fn new(canvas: Arc<Canvas>, nominal: f64, hint: Option<[f64; 2]>, map: Option<Sim>) -> Self {
-        Reference { canvas, nominal, map, hint, scales: Vec::new(), pcs: HashMap::new(), failed: 0 }
+        Reference { canvas, nominal, map, hint, scales: Vec::new(), pcs: HashMap::new(), failed: 0, frozen: false }
     }
 
     /// Find a frame near `guess` (its origin in reference pixels), searching
@@ -315,6 +317,11 @@ impl Reference {
         self.locate(&f, fw, fh, rough, 0.3, 2).map(|(q, _)| q)
     }
 
+    /// Number of scale measurements so far (see `observe_motion`).
+    pub fn scale_samples(&self) -> usize {
+        self.scales.len()
+    }
+
     /// Learn the scale from relative motion: the layer's own tracking says
     /// the view moved by `dp` (layer px) while the reference says `dq`. Only
     /// differences are used, so tracking drift cannot bias it. The mapping
@@ -323,6 +330,9 @@ impl Reference {
     pub fn observe_motion(&mut self, dp: [f64; 2], dq: [f64; 2], p: [f64; 2], q: [f64; 2]) {
         const FREEZE_AFTER: usize = 100;
         let Some(map) = self.map else { return };
+        if self.frozen {
+            return;
+        }
         let len = (dp[0] * dp[0] + dp[1] * dp[1]).sqrt();
         if self.scales.len() >= FREEZE_AFTER || !(300.0..3000.0).contains(&len) {
             return;
