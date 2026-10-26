@@ -80,8 +80,30 @@ async function init() {
       bar.insertBefore(b, bar.firstChild);
     }
   }
-  fit();
+  if (!fromHash()) fit();
 }
+
+// The view is kept in the URL (#x=…&y=…&z=…: centre in project pixels and
+// zoom), so it can be bookmarked or shared.
+function fromHash() {
+  const p = new URLSearchParams(location.hash.slice(1));
+  const x = parseFloat(p.get("x")), y = parseFloat(p.get("y")), z = parseFloat(p.get("z"));
+  if (![x, y, z].every(Number.isFinite) || z <= 0) return false;
+  scale = z;
+  ox = view.clientWidth / 2 - x * scale;
+  oy = view.clientHeight / 2 - y * scale;
+  render();
+  return true;
+}
+let hashTimer = null;
+function toHash() {
+  clearTimeout(hashTimer);
+  hashTimer = setTimeout(() => {
+    const x = (view.clientWidth / 2 - ox) / scale, y = (view.clientHeight / 2 - oy) / scale;
+    history.replaceState(null, "", `#x=${x.toFixed(1)}&y=${y.toFixed(1)}&z=${scale.toPrecision(4)}`);
+  }, 300);
+}
+addEventListener("hashchange", fromHash);
 
 function extent() {
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
@@ -149,6 +171,7 @@ function render() {
   let txt = `zoom ${(scale * 100).toPrecision(3)}%` + (detail ? ` · ${detail}` : "");
   if (mouse) txt += ` · x ${((mouse[0] - ox) / scale).toFixed(0)} y ${((mouse[1] - oy) / scale).toFixed(0)}`;
   info.textContent = txt;
+  toHash();
 }
 
 let drag = null;
