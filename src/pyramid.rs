@@ -18,15 +18,10 @@ pub struct PyramidInfo {
 }
 
 fn encode_rgba(rgba: Vec<u8>) -> Result<Vec<u8>> {
-    let png = oxideav_png::PngImage {
-        width: TS as u32,
-        height: TS as u32,
-        pixel_format: oxideav_png::PngPixelFormat::Rgba,
-        stride: TS * 4,
-        data: rgba,
-        palette: Vec::new(),
-    };
-    oxideav_png::encode_png_image(&png).map_err(|e| anyhow!("PNG encode: {e}"))
+    let plane = oxideav_png::Plane::new(TS * 4, rgba);
+    let png = oxideav_png::PngImage::new(TS as u32, TS as u32, oxideav_png::PixelFormat::Rgba, vec![plane])
+        .map_err(|e| anyhow!("PNG image: {e}"))?;
+    oxideav_png::encode(&png, &oxideav_png::EncodeOptions::default()).map_err(|e| anyhow!("PNG encode: {e}"))
 }
 
 /// 2× downsample of a TS×TS RGBA tile, averaging only covered pixels.

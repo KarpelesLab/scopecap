@@ -40,8 +40,8 @@ fn main() -> anyhow::Result<()> {
         let name = p.file_stem().unwrap().to_string_lossy().into_owned();
         let (x, y) = name.split_once('_').unwrap();
         let k = ((x.parse::<i64>()? + origin[0] / 512) as i32, (y.parse::<i64>()? + origin[1] / 512) as i32);
-        let img = oxideav_png::decode_png(&std::fs::read(&p)?).map_err(|e| anyhow::anyhow!("{e}"))?;
-        tiles.push((k, img.data));
+        let img = oxideav_png::decode(&std::fs::read(&p)?).map_err(|e| anyhow::anyhow!("{e}"))?;
+        tiles.push((k, img.to_rgba8()));
     }
     println!("reference: {} tiles", tiles.len());
     let canvas = Arc::new(mosaic::Canvas::from_rgba_tiles(tiles));

@@ -453,16 +453,34 @@ pub fn encode_png16(img: &Lin, lv: Levels) -> Result<Vec<u8>> {
             o[k * 2..k * 2 + 2].copy_from_slice(&v.to_le_bytes());
         }
     });
-    let png = oxideav_png::PngImage {
-        width: img.w as u32,
-        height: img.h as u32,
-        pixel_format: oxideav_png::PngPixelFormat::Rgb48Le,
-        stride: img.w * 6,
-        data,
-        palette: Vec::new(),
-    };
-    match oxideav_png::encode_png_image(&png) {
+    let plane = oxideav_png::Plane::new(img.w * 6, data);
+    let png = oxideav_png::PngImage::new(img.w as u32, img.h as u32, oxideav_png::PixelFormat::Rgb48Le, vec![plane])
+        .map_err(|e| anyhow::anyhow!("PNG image: {e}"))?;
+    match oxideav_png::encode(&png, &oxideav_png::EncodeOptions::default()) {
         Ok(b) => Ok(b),
         Err(e) => bail!("PNG encode: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn png16_roundtrip() {
+        let mut img = Lin::new(7, 5);
+        for (i, v) in img.data.iter_mut().enumerate() {
+            *v = (i % 11) as f32 / 10.0;
+        }
+        let bytes = encode_png16(&img, Levels::default()).unwrap();
+        let back = oxideav_png::decode(&bytes).unwrap();
+        assert_eq!((back.width, back.height), (7, 5));
+        assert_eq!(back.format, oxideav_png::PixelFormat::Rgb48Le);
+        // Every sample: linear value → sRGB, 16-bit little-endian.
+        let d = &back.planes[0].data;
+        for (i, v) in img.data.iter().enumerate() {
+            let got = u16::from_le_bytes([d[i * 2], d[i * 2 + 1]]) as f32 / 65535.0;
+            assert!((got - lin_to_srgb(*v)).abs() < 1e-3, "sample {i}: {got}");
+        }
     }
 }

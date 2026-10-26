@@ -37,21 +37,12 @@ the mosaic can be rebuilt offline with better processing.
 
 ## Building
 
-Rust (2021 edition), Linux. MJPEG decoding and PNG encoding come from
-[OxideAV](https://github.com/OxideAV) (pure Rust). `Cargo.toml` currently
-points the three crates it uses at a sibling `../oxideav/crates/` checkout,
-so clone them there first:
+Rust (2024 edition), Linux. MJPEG decoding and PNG encoding come from the
+pure-Rust [OxideAV](https://github.com/OxideAV) crates on crates.io.
 
 ```sh
-mkdir -p ../oxideav/crates
-for c in oxideav-core oxideav-mjpeg oxideav-png; do
-  git clone https://github.com/OxideAV/$c ../oxideav/crates/$c
-done
 cargo build --release
 ```
-
-(If you already have the full oxideav workspace at `../oxideav`, nothing
-else is needed.)
 
 ## Usage
 

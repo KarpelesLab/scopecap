@@ -11,14 +11,9 @@ rayon = "1.12.0"
 rustfft = "6.4.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-oxideav-core = "0.1"
-oxideav-mjpeg = "0.1"
-oxideav-png = { version = "0.1", default-features = false }
-
-[patch.crates-io]
-oxideav-core = { path = "../oxideav/crates/oxideav-core" }
-oxideav-mjpeg = { path = "../oxideav/crates/oxideav-mjpeg" }
-oxideav-png = { path = "../oxideav/crates/oxideav-png" }
+oxideav-core = "0.1.42"
+oxideav-mjpeg = "0.1.13"
+oxideav-png = { version = "0.1.12", default-features = false }
 
 [profile.dev]
 opt-level = 2

@@ -20,11 +20,12 @@ use std::sync::{mpsc, Arc, Mutex};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let img = oxideav_png::decode_png(&std::fs::read(&args[1])?).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let img = oxideav_png::decode(&std::fs::read(&args[1])?).map_err(|e| anyhow::anyhow!("{e}"))?;
     let (bw, bh) = (img.width as usize, img.height as usize);
-    let bpp = img.bytes_per_pixel();
+    let rgb = img.to_rgb8();
+    let bpp = 3;
     let big: Vec<f32> = (0..bw * bh * 3)
-        .map(|i| proc::srgb_to_lin(img.data[(i / 3) * bpp + i % 3] as f32 / 255.0))
+        .map(|i| proc::srgb_to_lin(rgb[(i / 3) * bpp + i % 3] as f32 / 255.0))
         .collect();
     let (w, h) = (1920usize, 1080usize);
     // Path: right along the top, quick jump down, back left, with pauses.

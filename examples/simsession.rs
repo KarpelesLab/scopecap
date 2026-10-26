@@ -16,10 +16,11 @@ use std::io::Write;
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let img = oxideav_png::decode_png(&std::fs::read(&args[1])?).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let img = oxideav_png::decode(&std::fs::read(&args[1])?).map_err(|e| anyhow::anyhow!("{e}"))?;
     let out = std::path::PathBuf::from(&args[2]);
     std::fs::create_dir_all(&out)?;
-    let (bw, bh, bpp) = (img.width as usize, img.height as usize, img.bytes_per_pixel());
+    let src = img.to_rgb8();
+    let (bw, bh, bpp) = (img.width as usize, img.height as usize, 3);
     let (w, h) = (1920usize, 1080usize);
     let vig = |x: f64, y: f64, c: usize| {
         let (u, v) = (2.0 * x / w as f64 - 1.0, 2.0 * y / h as f64 - 1.0);
@@ -92,7 +93,7 @@ fn main() -> anyhow::Result<()> {
                         for i in 0..k {
                             let sx = (px + (x as f64 + (i as f64 + 0.5) / k as f64) / scale) as usize;
                             let sy = (py + (y as f64 + (j as f64 + 0.5) / k as f64) / scale) as usize;
-                            lin += proc::srgb_to_lin(img.data[(sy.min(bh - 1) * bw + sx.min(bw - 1)) * bpp + c] as f32 / 255.0);
+                            lin += proc::srgb_to_lin(src[(sy.min(bh - 1) * bw + sx.min(bw - 1)) * bpp + c] as f32 / 255.0);
                         }
                     }
                     lin = lin / (k * k) as f32 * vig(x as f64, y as f64, c) as f32;
