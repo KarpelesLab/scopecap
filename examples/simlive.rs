@@ -35,14 +35,25 @@ fn main() -> anyhow::Result<()> {
         tx.send(mosaic::Msg::Start { levels: proc::Levels { lo: 0.0, hi: 1.0 }, rec: None })?;
         let frames: Vec<recorder::FrameRec> = recorder::read_jsonl(&std::path::Path::new(dir).join("frames.jsonl"))?;
         let stream = std::fs::read(std::path::Path::new(dir).join("stream.mjpeg"))?;
-        let mut dec = proc::make_decoder(1920, 1080).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let info: recorder::SessionInfo = serde_json::from_slice(&std::fs::read(std::path::Path::new(dir).join("session.json"))?)?;
+        let (w, h) = (info.width as usize, info.height as usize);
+        let mut dec = proc::make_decoder(w as u32, h as u32).map_err(|e| anyhow::anyhow!("{e}"))?;
+        // SIMLIVE_LIVE=1: only the frames the live app got to process
+        // (those in track.jsonl), to reproduce its behaviour.
+        let live: Option<std::collections::HashSet<u64>> = std::env::var_os("SIMLIVE_LIVE").map(|_| {
+            recorder::read_jsonl::<recorder::TrackRec>(&std::path::Path::new(dir).join("track.jsonl"))
+                .unwrap_or_default()
+                .iter()
+                .map(|t| t.seq)
+                .collect()
+        });
         // SIMLIVE_LIMIT=n: only the first n frames of each session.
         let limit: usize = std::env::var("SIMLIVE_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
         let (mut ms, mut n) = (Vec::new(), 0);
         let mut states = std::collections::BTreeMap::new();
-        for f in frames.iter().take(limit) {
+        for f in frames.iter().filter(|f| live.as_ref().is_none_or(|l| l.contains(&f.seq))).take(limit) {
             let jpeg = stream[f.off as usize..f.off as usize + f.len as usize].to_vec();
-            let Some((lin, _)) = proc::decode(dec.as_mut(), jpeg, 1920, 1080) else { continue };
+            let Some((lin, _)) = proc::decode(dec.as_mut(), jpeg, w, h) else { continue };
             pending.fetch_add(1, Ordering::SeqCst);
             tx.send(mosaic::Msg::Frame { seq: f.seq, img: Arc::new(lin) })?;
             while pending.load(Ordering::SeqCst) > 0 {

@@ -54,6 +54,12 @@ const SEARCH_EVERY: u32 = 8;
 const NEAR_MIN_REL: f32 = 0.8;
 /// Consecutive still frames required before pasting resumes after motion.
 const SETTLE_FRAMES: u32 = 2;
+/// Settled frames that may wait for the post-move check against the lower
+/// layer before being pasted anyway (as low confidence).
+const VERIFY_TRIES: u32 = 10;
+/// Disagreement with the lower layer (in its pixels) that the post-move
+/// check treats as tracking having slipped: 3× its ambiguity scale.
+const JUMP_CHECK_PX: f64 = 48.0;
 /// Consecutive lost frames with a clear view before a new island is started.
 const NEW_ISLAND_AFTER: u32 = 10;
 /// Relocations must agree with the canvas pixel-wise (normalised
@@ -453,6 +459,9 @@ pub struct Mosaic {
     /// Consecutive checks disagreeing with the lower layer beyond its
     /// ambiguity scale.
     disagree: u32,
+    /// The view has moved since the position was last confirmed over a wide
+    /// area of the lower layer; counts settled frames spent waiting.
+    unverified: Option<u32>,
 }
 
 struct LayerRt {
@@ -731,6 +740,7 @@ impl Mosaic {
             last_conf: CONF_HIGH,
             last_ff: [0.0; 2],
             disagree: 0,
+            unverified: None,
         }
     }
 
@@ -739,6 +749,7 @@ impl Mosaic {
     pub fn resume(&mut self) {
         self.prev_small = None;
         self.last_ff = [0.0; 2];
+        self.unverified = Some(0);
         self.track = if self.canvas.tiles.is_empty() { Track::Ok } else { Track::Lost };
     }
 
@@ -1033,9 +1044,50 @@ impl Mosaic {
         // slow for an instant while still wobbling, skewed by the rolling
         // shutter.
         self.still_run = if speed > self.max_speed { 0 } else { self.still_run + 1 };
+        if speed > self.max_speed || from_reference {
+            self.unverified = Some(0);
+        }
         if self.still_run <= SETTLE_FRAMES {
             self.track = Track::TooFast;
             return (Vec::new(), peak, speed);
+        }
+        // After a move, and especially a jump, tracking can lock onto a
+        // look-alike one period of a repeating structure away, and a check
+        // of the lower layer near that position agrees with it (the same
+        // structure repeats there). Before pasting, match the frame against a
+        // wide area of the lower layer, where the surroundings tell the
+        // periods apart, and move there if tracking is off.
+        if let (Some(tries), Some(r)) = (self.unverified, self.reference.as_mut()) {
+            let found = r.check(&g, w, h, pos, 1.5).or_else(|| r.find(&g, w, h));
+            match (found, r.map) {
+                (Some(q), Some(map)) => {
+                    let pr = map.invert(q);
+                    let err = ((pos[0] - pr[0]).powi(2) + (pos[1] - pr[1]).powi(2)).sqrt();
+                    // Only gross errors: the live lower layer is itself off
+                    // by a few of its pixels here and there, and finer
+                    // disagreements are the regular check's business.
+                    let gross = JUMP_CHECK_PX / map.s;
+                    if err > gross {
+                        pos = match self.refine(&self.canvas, &g, w, h, pr, RELOC_MIN_COVER, true) {
+                            Some((p, _)) if ((p[0] - pr[0]).powi(2) + (p[1] - pr[1]).powi(2)).sqrt() <= gross => p,
+                            _ => pr,
+                        };
+                        self.pos = pos;
+                        self.events.push(format!("after a jump: moved the view by {err:.0} px to where the lower layer has it"));
+                    }
+                    conf = CONF_HIGH;
+                    self.unverified = None;
+                }
+                _ if tries + 1 >= VERIFY_TRIES => {
+                    conf = CONF_LOW;
+                    self.unverified = None;
+                }
+                _ => {
+                    self.unverified = Some(tries + 1);
+                    self.track = Track::TooFast;
+                    return (Vec::new(), peak, speed);
+                }
+            }
         }
         if self.join && !self.others.is_empty() {
             self.since_search += 1;
