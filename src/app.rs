@@ -5,7 +5,8 @@ use crate::project::{mag_label, Project};
 use crate::recorder::SessionInfo;
 use crate::reference::Sim;
 use crate::proc::{Correction, Flat};
-use crate::v4l2::{CtrlInfo, CtrlKind, Device};
+use crate::source::{self, Source};
+use crate::v4l2::{CtrlInfo, CtrlKind};
 use eframe::egui::{self, Color32, ColorImage, RichText, Sense, TextureHandle, TextureOptions, Vec2};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -120,21 +121,19 @@ impl App {
         app
     }
 
+    /// Opens (or reopens) the camera chosen in the settings.
     fn open_camera(&mut self, ctx: egui::Context) -> anyhow::Result<()> {
-        let mut dev = Device::open(&self.settings.device)?;
-        // Apply saved controls in device enumeration order, so that mode
-        // switches (auto exposure / auto WB) land before the values they gate.
-        for c in dev.controls() {
-            if let Some(&v) = self.settings.controls.get(&c.name) {
-                if let Err(e) = dev.set_control(c.id, v) {
-                    eprintln!("restoring {}: {e:#}", c.name);
-                }
-            }
+        if let Some(cam) = self.cam.take() {
+            self.settings.wbs.insert(cam.dev.key().into(), self.settings.wb);
+            // Dropping waits for the capture thread to release the device.
+            drop(cam);
         }
-        dev.start(1920, 1080, 30)?;
+        self.controls.clear();
+        let dev = Source::open(&self.settings.device, &self.settings.controls)?;
+        self.settings.wb = self.settings.wb_for(dev.key());
         self.controls = dev.controls();
-        self.flat = config::load_flat().map(|mut f| {
-            f.prepare(dev.width as usize, dev.height as usize);
+        self.flat = config::load_flat(dev.key()).map(|mut f| {
+            f.prepare(dev.width() as usize, dev.height() as usize);
             Arc::new(f)
         });
         let corr = self.correction();
@@ -175,6 +174,11 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &ui.ctx().clone();
+        if let Some(cam) = &self.cam
+            && self.settings.wbs.get(cam.dev.key()) != Some(&self.settings.wb)
+        {
+            self.settings.wbs.insert(cam.dev.key().into(), self.settings.wb);
+        }
         let before = self.settings.clone();
 
         // Pull the latest state from the pipeline.
@@ -206,7 +210,8 @@ impl eframe::App for App {
                 self.error = Some(e);
             }
             if let Some(f) = l.new_flat.take() {
-                if let Err(e) = config::save_flat(&f) {
+                let key = self.cam.as_ref().map(|c| c.dev.key()).unwrap_or("");
+                if let Err(e) = config::save_flat(&f, key) {
                     self.error = Some(format!("saving flat: {e}"));
                 }
                 self.flat = Some(f);
@@ -604,6 +609,7 @@ impl App {
             created: config::timestamp(),
             width: self.frame_size[0] as u32,
             height: self.frame_size[1] as u32,
+            camera: cam.dev.key().into(),
             settings: serde_json::to_value(&self.settings).unwrap_or_default(),
         };
         let flat = self.flat.as_ref().filter(|_| self.settings.use_flat).map(|f| config::flat_bytes(f));
@@ -845,13 +851,36 @@ impl App {
     }
 
     fn camera_controls(&mut self, ui: &mut egui::Ui) {
+        // Switching camera or frame size restarts the pipeline: not while
+        // a recording session is open.
+        let busy = self.cam.as_ref().is_some_and(|c| c.session().is_some());
+        let mut device = self.settings.device.clone();
+        let devices = source::available();
+        let cur = devices.iter().find(|d| d.0 == device).map(|d| d.1.clone()).unwrap_or_else(|| device.clone());
+        ui.add_enabled_ui(!busy, |ui| {
+            egui::ComboBox::from_label("Camera").selected_text(cur).show_ui(ui, |ui| {
+                for (spec, name) in &devices {
+                    ui.selectable_value(&mut device, spec.clone(), name);
+                }
+            })
+        });
+        if device != self.settings.device {
+            self.settings.device = device;
+            if let Err(e) = self.open_camera(ui.ctx().clone()) {
+                self.error = Some(format!("{e:#}"));
+            }
+            return;
+        }
         let Some(cam) = &self.cam else { return };
+        ui.small(cam.dev.name());
         let mut changed = None;
         for c in &self.controls {
             let mut v = c.value;
             let resp = ui
-                .add_enabled_ui(!c.inactive, |ui| match &c.kind {
-                    CtrlKind::Int => ui.add(egui::Slider::new(&mut v, c.min..=c.max).step_by(c.step as f64).text(&c.name)),
+                .add_enabled_ui(!c.inactive && !(busy && c.restart), |ui| match &c.kind {
+                    CtrlKind::Int => {
+                        ui.add(egui::Slider::new(&mut v, c.min..=c.max).step_by(c.step as f64).logarithmic(c.log).text(&c.name))
+                    }
                     CtrlKind::Bool => {
                         let mut b = v != 0;
                         let r = ui.checkbox(&mut b, &c.name);
@@ -879,10 +908,17 @@ impl App {
             }
         }
         if let Some((id, name, v)) = changed {
+            self.settings.controls.insert(name.clone(), v);
+            if self.controls.iter().any(|c| c.id == id && c.restart) {
+                // A new frame size: the whole pipeline starts over.
+                if let Err(e) = self.open_camera(ui.ctx().clone()) {
+                    self.error = Some(format!("{name}: {e:#}"));
+                }
+                return;
+            }
             if let Err(e) = cam.dev.set_control(id, v) {
                 self.error = Some(format!("{name}: {e:#}"));
             }
-            self.settings.controls.insert(name, v);
             // Re-read: values get clamped and other controls may (in)activate.
             self.controls = cam.dev.controls();
         }

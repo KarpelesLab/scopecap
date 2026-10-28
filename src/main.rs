@@ -12,6 +12,8 @@ mod recorder;
 mod reference;
 mod register;
 mod render;
+mod source;
+mod touptek;
 mod v4l2;
 
 fn main() -> eframe::Result<()> {

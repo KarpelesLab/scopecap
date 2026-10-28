@@ -142,6 +142,88 @@ pub fn yuv_to_lin(f: &Yuv) -> Lin {
     out
 }
 
+/// Sensor black level of 8-bit raw Bayer frames (ToupTek IMX183).
+pub const BAYER_BLACK: f32 = 12.0;
+
+/// Bilinear demosaic of 8-bit RGGB data to linear RGB. Also returns the
+/// sRGB-encoded luma plane (what a JPEG's Y plane would hold), which the
+/// focus and motion measures work on.
+pub fn debayer(raw: &[u8], w: usize, h: usize) -> (Lin, Vec<u8>) {
+    let mut lut = [0f32; 256];
+    for (v, l) in lut.iter_mut().enumerate() {
+        *l = ((v as f32 - BAYER_BLACK) / (255.0 - BAYER_BLACK)).max(0.0);
+    }
+    let mut out = Lin::new(w, h);
+    let mut luma = vec![0u8; w * h];
+    out.data.par_chunks_mut(w * 3).zip(luma.par_chunks_mut(w)).enumerate().for_each(|(y, (line, yl))| {
+        let row = |dy: isize| {
+            let yy = (y as isize + dy).clamp(0, h as isize - 1) as usize;
+            &raw[yy * w..yy * w + w]
+        };
+        let (up, mid, dn) = (row(-1), row(0), row(1));
+        let px = |r: &[u8], x: isize| lut[r[x.clamp(0, w as isize - 1) as usize] as usize];
+        for x in 0..w {
+            let xi = x as isize;
+            let c = px(mid, xi);
+            let cross = (px(up, xi) + px(dn, xi) + px(mid, xi - 1) + px(mid, xi + 1)) * 0.25;
+            let diag = (px(up, xi - 1) + px(up, xi + 1) + px(dn, xi - 1) + px(dn, xi + 1)) * 0.25;
+            let horiz = (px(mid, xi - 1) + px(mid, xi + 1)) * 0.5;
+            let vert = (px(up, xi) + px(dn, xi)) * 0.5;
+            let rgb = match (y & 1, x & 1) {
+                (0, 0) => [c, cross, diag],
+                (0, 1) => [horiz, c, vert],
+                (1, 0) => [vert, c, horiz],
+                _ => [diag, cross, c],
+            };
+            line[x * 3..x * 3 + 3].copy_from_slice(&rgb);
+            let (r, g, b) = (enc8(rgb[0]) as f32, enc8(rgb[1]) as f32, enc8(rgb[2]) as f32);
+            yl[x] = (0.299 * r + 0.587 * g + 0.114 * b + 0.5) as u8;
+        }
+    });
+    (out, luma)
+}
+
+/// Encodes a linear frame as a 4:2:2 JPEG (the format the rest of the
+/// pipeline records and reads back).
+pub fn encode_jpeg(f: &Lin, quality: u8) -> Result<Vec<u8>> {
+    let (w, h) = (f.w, f.h);
+    let cw = w.div_ceil(2);
+    let mut y = vec![0u8; w * h];
+    let mut cb = vec![0u8; cw * h];
+    let mut cr = vec![0u8; cw * h];
+    y.par_chunks_mut(w).zip(cb.par_chunks_mut(cw)).zip(cr.par_chunks_mut(cw)).enumerate().for_each(
+        |(row, ((yl, cbl), crl))| {
+            let src = &f.data[row * w * 3..(row + 1) * w * 3];
+            let mut acc = [0f32; 2];
+            for x in 0..w {
+                let p = &src[x * 3..x * 3 + 3];
+                let (r, g, b) = (enc8(p[0]) as f32, enc8(p[1]) as f32, enc8(p[2]) as f32);
+                yl[x] = (0.299 * r + 0.587 * g + 0.114 * b + 0.5) as u8;
+                acc[0] += -0.168_736 * r - 0.331_264 * g + 0.5 * b;
+                acc[1] += 0.5 * r - 0.418_688 * g - 0.081_312 * b;
+                if x & 1 == 1 || x == w - 1 {
+                    let n = if x & 1 == 1 { 2.0 } else { 1.0 };
+                    cbl[x / 2] = (acc[0] / n + 128.5).clamp(0.0, 255.0) as u8;
+                    crl[x / 2] = (acc[1] / n + 128.5).clamp(0.0, 255.0) as u8;
+                    acc = [0.0; 2];
+                }
+            }
+        },
+    );
+    let frame = oxideav_core::VideoFrame {
+        pts: None,
+        planes: vec![
+            oxideav_core::VideoPlane { stride: w, data: y },
+            oxideav_core::VideoPlane { stride: cw, data: cb },
+            oxideav_core::VideoPlane { stride: cw, data: cr },
+        ],
+    };
+    match oxideav_mjpeg::encoder::encode_jpeg(&frame, w as u32, h as u32, oxideav_core::PixelFormat::Yuv422P, quality) {
+        Ok(j) => Ok(j),
+        Err(e) => bail!("jpeg encode: {e}"),
+    }
+}
+
 /// Low-resolution flat-field: per-channel relative illumination, normalised
 /// so that a uniformly reflective target corrects to neutral grey.
 #[derive(Clone)]
@@ -465,6 +547,42 @@ pub fn encode_png16(img: &Lin, lv: Levels) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A smooth coloured scene sampled through an RGGB mosaic comes back
+    /// from demosaicing, then through JPEG encode/decode, close to the
+    /// original.
+    #[test]
+    fn bayer_jpeg_roundtrip() {
+        let (w, h) = (96usize, 64usize);
+        let scene = |x: usize, y: usize| [0.2 + 0.5 * x as f32 / w as f32, 0.4, 0.1 + 0.6 * y as f32 / h as f32];
+        let raw: Vec<u8> = (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                let c = match (y & 1, x & 1) {
+                    (0, 0) => 0,
+                    (1, 1) => 2,
+                    _ => 1,
+                };
+                (scene(x, y)[c] * (255.0 - BAYER_BLACK) + BAYER_BLACK).round() as u8
+            })
+            .collect();
+        let (lin, luma) = debayer(&raw, w, h);
+        let mut worst = 0f32;
+        for y in 1..h - 1 {
+            for x in 1..w - 1 {
+                for c in 0..3 {
+                    worst = worst.max((lin.data[(y * w + x) * 3 + c] - scene(x, y)[c]).abs());
+                }
+            }
+        }
+        assert!(worst < 0.02, "demosaic error {worst}");
+        assert!(luma.iter().all(|&v| v > 0));
+        let jpeg = encode_jpeg(&lin, 95).unwrap();
+        let mut dec = make_decoder(w as u32, h as u32).unwrap();
+        let (back, _) = decode(dec.as_mut(), jpeg, w, h).unwrap();
+        let err = back.data.iter().zip(&lin.data).map(|(a, b)| (a - b).abs()).sum::<f32>() / back.data.len() as f32;
+        assert!(err < 0.01, "jpeg round trip error {err}");
+    }
 
     #[test]
     fn png16_roundtrip() {

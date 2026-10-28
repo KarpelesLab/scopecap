@@ -171,6 +171,10 @@ pub struct CtrlInfo {
     pub default: i32,
     pub value: i32,
     pub inactive: bool,
+    /// Wide range: use a logarithmic slider.
+    pub log: bool,
+    /// Takes effect only when the camera is restarted.
+    pub restart: bool,
 }
 
 struct Mapping {
@@ -336,6 +340,8 @@ impl Device {
                 default: q.default_value,
                 value,
                 inactive: q.flags & CTRL_FLAG_INACTIVE != 0,
+                log: false,
+                restart: false,
             });
         }
         out

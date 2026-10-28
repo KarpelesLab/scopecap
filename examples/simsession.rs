@@ -111,6 +111,7 @@ fn main() -> anyhow::Result<()> {
         created: "sim".into(),
         width: w as u32,
         height: h as u32,
+        camera: String::new(),
         settings: serde_json::json!({ "wb": [1.0, 1.0, 1.0], "levels": { "lo": 0.0, "hi": 1.0 } }),
     };
     std::fs::write(out.join("session.json"), serde_json::to_vec_pretty(&info)?)?;

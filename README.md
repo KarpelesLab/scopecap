@@ -1,8 +1,9 @@
 # scopecap
 
 Live capture, stitching and multi-zoom mapping for a microscope with a USB
-camera. Built for an Olympus BX60M with a generic UVC camera on the photo
-port, but it should work with any V4L2 camera that streams MJPEG.
+camera. Built for an Olympus BX60M. It works with any V4L2 camera that
+streams MJPEG, and has its own pure-Rust driver for the ToupTek
+E3ISPM20000KPA (20 MP Sony IMX183, raw Bayer over USB3).
 
 You move the stage by hand and scopecap builds the image as you go: it
 tracks every frame, keeps the sharpest version of each spot (so sweeping the
@@ -42,6 +43,22 @@ the mosaic can be rebuilt offline with better processing.
   viewer: pan/zoom like a map, only visible tiles load, works straight from
   disk. Multi-layer projects stack all magnifications with per-layer toggles.
 
+### ToupTek E3ISPM20000KPA
+
+Driven directly over USB with [rawusb](https://crates.io/crates/rawusb): no
+vendor SDK or kernel module. The protocol was worked out from the vendor's
+library (see [docs/touptek.md](docs/touptek.md)).
+
+- 5440×3648 at 15 fps, 2736×1824 (2×2 binning) at 50 fps, 1824×1216 (3×3)
+  at 60 fps; exposure 0.1 ms – 5 s; analog gain 1–22×.
+- Raw 8-bit Bayer, demosaiced on the host. Recordings store frames as JPEG
+  (about 0.5 MB per 2736×1824 frame), so offline rendering works as before.
+- Needs read/write access to the USB device: either the `usb` group or a
+  udev rule such as
+  `SUBSYSTEM=="usb", ATTRS{idVendor}=="0547", ATTRS{idProduct}=="112[23]", MODE="0660", GROUP="video"`.
+- `cargo run --release --example toupcap` streams for a few seconds and
+  reports frame rate and losses.
+
 ## Building
 
 Rust (2024 edition), Linux. MJPEG decoding and PNG encoding come from the
@@ -59,7 +76,9 @@ cargo build --release
 cargo run --release
 ```
 
-The camera defaults to `/dev/video0` at 1920×1080 MJPEG. Settings are kept
+The camera is chosen in *Camera controls*. *Automatic* uses a ToupTek camera
+when one is plugged in, else `/dev/video0` at 1920×1080 MJPEG. White balance
+and the flat-field calibration are kept per camera. Settings are kept
 in `~/.config/scopecap/settings.json` and captures/projects go to
 `~/Pictures/scopecap/` (configurable in the app).
 

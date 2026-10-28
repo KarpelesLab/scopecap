@@ -341,8 +341,8 @@ fn render_layer(sessions: &[Session], o: &Opts, out: &Path, make_ref: impl Fn() 
     if let Some(f) = &corr.flat {
         std::fs::write(out.join("flat.bin"), config::flat_bytes(f))?;
         if o.install_flat {
-            config::save_flat(f)?;
-            println!("   installed as the live flat-field calibration ({})", config::config_dir().join("flat.bin").display());
+            config::save_flat(f, &s0.info.camera)?;
+            println!("   installed as the live flat-field calibration of this camera");
         }
     }
 

@@ -2732,6 +2732,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rawusb"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36eb91f3d99648742b819d54b8bc33941ee5740ff1b3bb0e77903daa94b5dfba"
+
+[[package]]
 name = "rayon"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2890,6 +2896,7 @@ dependencies = [
  "oxideav-core",
  "oxideav-mjpeg",
  "oxideav-png",
+ "rawusb",
  "rayon",
  "rustfft",
  "serde",

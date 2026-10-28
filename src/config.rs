@@ -9,10 +9,15 @@ use std::path::PathBuf;
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct Settings {
+    /// "auto", "touptek" or a V4L2 device path; see `source::available`.
     pub device: String,
-    /// V4L2 control values by control name, re-applied at startup.
+    /// Camera control values by control name, re-applied at startup.
     pub controls: BTreeMap<String, i32>,
+    /// White balance of the camera in use.
     pub wb: [f32; 3],
+    /// White balance of each kind of camera (`Source::key`), so switching
+    /// cameras brings back the right one.
+    pub wbs: BTreeMap<String, [f32; 3]>,
     pub use_flat: bool,
     pub levels: Option<Levels>,
     pub peaking: bool,
@@ -45,10 +50,11 @@ impl Default for Settings {
         .collect();
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         Settings {
-            device: "/dev/video0".into(),
+            device: "auto".into(),
             controls,
             // Linear-light gains measured for the BX60M halogen lamp at 3300 K.
             wb: [1.0, 1.97, 2.06],
+            wbs: BTreeMap::new(),
             use_flat: true,
             levels: None,
             peaking: false,
@@ -74,10 +80,29 @@ pub fn config_dir() -> PathBuf {
 
 impl Settings {
     pub fn load() -> Self {
-        std::fs::read(config_dir().join("settings.json"))
+        let mut s: Settings = std::fs::read(config_dir().join("settings.json"))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // "/dev/video0" was the fixed default before cameras could be chosen.
+        if s.device == "/dev/video0" {
+            s.device = "auto".into();
+        }
+        // Settings from before per-camera white balance: theirs is the V4L2 camera's.
+        if s.wbs.is_empty() {
+            s.wbs.insert("v4l2".into(), s.wb);
+        }
+        s
+    }
+
+    /// White balance to start from for a kind of camera.
+    pub fn wb_for(&self, key: &str) -> [f32; 3] {
+        match self.wbs.get(key) {
+            Some(w) => *w,
+            // Raw IMX183 data under the BX60M's halogen lamp.
+            None if key == "touptek" => [1.0, 0.96, 4.1],
+            None => [1.0, 1.97, 2.06],
+        }
     }
 
     pub fn save(&self) {
@@ -92,9 +117,17 @@ impl Settings {
 
 const FLAT_MAGIC: &[u8; 4] = b"SCF1";
 
-pub fn save_flat(f: &Flat) -> std::io::Result<()> {
+/// Flat-field calibration file of a kind of camera (`Source::key`).
+fn flat_path(camera: &str) -> PathBuf {
+    match camera {
+        "v4l2" | "" => config_dir().join("flat.bin"),
+        k => config_dir().join(format!("flat-{k}.bin")),
+    }
+}
+
+pub fn save_flat(f: &Flat, camera: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(config_dir())?;
-    std::fs::write(config_dir().join("flat.bin"), flat_bytes(f))
+    std::fs::write(flat_path(camera), flat_bytes(f))
 }
 
 pub fn flat_bytes(f: &Flat) -> Vec<u8> {
@@ -108,8 +141,8 @@ pub fn flat_bytes(f: &Flat) -> Vec<u8> {
     b
 }
 
-pub fn load_flat() -> Option<Flat> {
-    load_flat_from(&config_dir().join("flat.bin"))
+pub fn load_flat(camera: &str) -> Option<Flat> {
+    load_flat_from(&flat_path(camera))
 }
 
 pub fn load_flat_from(path: &std::path::Path) -> Option<Flat> {

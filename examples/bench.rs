@@ -1,5 +1,6 @@
 //! Headless pipeline check: runs the capture/decode/correct pipeline for a
 //! few seconds and prints throughput.
+//! usage: bench [record-dir (default /tmp)] [device: auto|touptek|/dev/videoN]
 #[path = "../src/camera.rs"]
 mod camera;
 #[path = "../src/mosaic.rs"]
@@ -16,13 +17,20 @@ mod reference;
 mod project;
 #[path = "../src/proc.rs"]
 mod proc;
+#[path = "../src/source.rs"]
+mod source;
+#[path = "../src/touptek.rs"]
+#[allow(dead_code)]
+mod touptek;
 #[path = "../src/v4l2.rs"]
 mod v4l2;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 fn main() -> anyhow::Result<()> {
-    let mut d = v4l2::Device::open("/dev/video0")?;
-    d.start(1920, 1080, 30)?;
+    let spec = std::env::args().nth(2).unwrap_or_else(|| "auto".into());
+    let d = source::Source::open(&spec, &Default::default())?;
+    let (w, h, key) = (d.width(), d.height(), d.key());
+    println!("{} {w}×{h}", d.name());
     let n = Arc::new(AtomicU64::new(0));
     let n2 = n.clone();
     let mut cam = camera::Camera::start(d, proc::Correction::default(),
@@ -31,8 +39,9 @@ fn main() -> anyhow::Result<()> {
     let base = std::env::args().nth(1).unwrap_or_else(|| "/tmp".into());
     let info = recorder::SessionInfo {
         created: "bench".into(),
-        width: 1920,
-        height: 1080,
+        width: w,
+        height: h,
+        camera: key.into(),
         settings: serde_json::json!({ "wb": [1.0, 1.97, 2.06] }),
     };
     cam.start_scan(proc::Levels { lo: 0.0, hi: 1.0 }, std::path::Path::new(&base), info, None)?;

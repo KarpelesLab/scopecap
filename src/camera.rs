@@ -1,12 +1,12 @@
-//! Capture pipeline: one thread pulls MJPEG frames from the device, a few
-//! workers decode + correct them in parallel, and a coordinator thread
+//! Capture pipeline: one thread pulls frames (MJPEG or raw Bayer) from the
+//! camera, a few workers decode + correct them in parallel, and a coordinator thread
 //! re-orders results, measures motion, runs calibration / capture jobs and
 //! publishes the latest frame to the UI.
 
 use crate::mosaic;
 use crate::recorder::{Rec, Recorder, SessionInfo};
 use crate::proc::{self, Correction, Flat, Levels, Lin};
-use crate::v4l2::Device;
+use crate::source::{Format, Source};
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -14,6 +14,7 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
+/// Decode workers for a 1080p MJPEG stream; scaled up with the frame size.
 const WORKERS: usize = 3;
 
 pub struct LiveFrame {
@@ -78,7 +79,7 @@ pub enum Cmd {
 }
 
 pub struct Camera {
-    pub dev: Arc<Device>,
+    pub dev: Arc<Source>,
     pub live: Arc<Mutex<Live>>,
     pub corr: Arc<RwLock<Arc<Correction>>>,
     pub params: Arc<Mutex<Params>>,
@@ -92,11 +93,12 @@ pub struct Camera {
     session: Option<(Recorder, Instant)>,
     /// Where the capture thread sends raw frames while recording.
     rec_sink: Arc<Mutex<Option<(Sender<Rec>, Instant)>>>,
+    capture: Option<std::thread::JoinHandle<()>>,
 }
 
 struct Raw {
     seq: u64,
-    jpeg: Vec<u8>,
+    data: Vec<u8>,
 }
 
 struct Processed {
@@ -114,7 +116,7 @@ struct Processed {
 
 impl Camera {
     pub fn start(
-        dev: Device,
+        dev: Source,
         corr: Correction,
         params: Params,
         repaint: impl Fn() + Send + Sync + 'static,
@@ -127,23 +129,24 @@ impl Camera {
         let want_raw = Arc::new(AtomicBool::new(false));
         let dropped = Arc::new(AtomicU64::new(0));
         let (cmd_tx, cmd_rx) = mpsc::channel();
-        let (raw_tx, raw_rx) = mpsc::sync_channel::<Raw>(WORKERS);
+        let workers = WORKERS.max((WORKERS * (dev.width() * dev.height()) as usize).div_ceil(1920 * 1080)).min(16);
+        let (raw_tx, raw_rx) = mpsc::sync_channel::<Raw>(workers);
         let raw_rx = Arc::new(Mutex::new(raw_rx));
         let (proc_tx, proc_rx) = mpsc::channel::<Processed>();
 
         let rec_sink: Arc<Mutex<Option<(Sender<Rec>, Instant)>>> = Arc::new(Mutex::new(None));
-        {
+        let capture = {
             let (dev, stop, live, dropped, sink) = (dev.clone(), stop.clone(), live.clone(), dropped.clone(), rec_sink.clone());
             std::thread::Builder::new().name("capture".into()).spawn(move || {
                 capture_loop(&dev, &stop, &live, &dropped, &sink, raw_tx)
-            })?;
-        }
-        for i in 0..WORKERS {
+            })?
+        };
+        for i in 0..workers {
             let (raw_rx, proc_tx, corr, want_raw, live) =
                 (raw_rx.clone(), proc_tx.clone(), corr.clone(), want_raw.clone(), live.clone());
-            let (w, h) = (dev.width, dev.height);
+            let (w, h, fmt) = (dev.width(), dev.height(), dev.format());
             std::thread::Builder::new().name(format!("decode{i}")).spawn(move || {
-                worker_loop(w, h, &raw_rx, &proc_tx, &corr, &want_raw, &live)
+                worker_loop(w, h, fmt, &raw_rx, &proc_tx, &corr, &want_raw, &live)
             })?;
         }
         drop(proc_tx);
@@ -165,7 +168,20 @@ impl Camera {
                 coordinator(proc_rx, cmd_rx, &live, &params, &corr, &want_raw, &dropped, &fwd, move || repaint())
             })?;
         }
-        Ok(Camera { dev, live, corr, params, cmd: cmd_tx, stop, mosaic, mosaic_tx, scanning, session: None, rec_sink })
+        Ok(Camera {
+            dev,
+            live,
+            corr,
+            params,
+            cmd: cmd_tx,
+            stop,
+            mosaic,
+            mosaic_tx,
+            scanning,
+            session: None,
+            rec_sink,
+            capture: Some(capture),
+        })
     }
 
     pub fn send(&self, c: Cmd) {
@@ -220,11 +236,16 @@ impl Camera {
 impl Drop for Camera {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // The capture thread holds the device; wait for it to let go so the
+        // camera can be reopened right away.
+        if let Some(t) = self.capture.take() {
+            let _ = t.join();
+        }
     }
 }
 
 fn capture_loop(
-    dev: &Device,
+    dev: &Source,
     stop: &AtomicBool,
     live: &Mutex<Live>,
     dropped: &AtomicU64,
@@ -233,6 +254,8 @@ fn capture_loop(
 ) {
     let mut seq = 0u64;
     let mut buf = Vec::new();
+    let mut lost = 0;
+    let (w, h, fmt) = (dev.width(), dev.height(), dev.format());
     while !stop.load(Ordering::Relaxed) {
         match dev.read_frame(&mut buf, 500) {
             Ok(false) => continue,
@@ -243,16 +266,22 @@ fn capture_loop(
             }
         }
         seq += 1;
+        let l = dev.dropped();
+        dropped.fetch_add(l - lost, Ordering::Relaxed);
+        lost = l;
         // Recording gets every frame, even ones the live pipeline drops.
         if let Some((r, t0)) = &*rec.lock().unwrap() {
             let t = t0.elapsed().as_micros() as u64;
-            let _ = r.send(Rec::Frame { seq, t, jpeg: buf.clone() });
+            let _ = r.send(match fmt {
+                Format::Mjpeg => Rec::Frame { seq, t, jpeg: buf.clone() },
+                Format::Bayer8 => Rec::Bayer { seq, t, w: w as usize, h: h as usize, raw: buf.clone() },
+            });
         }
-        match tx.try_send(Raw { seq, jpeg: std::mem::take(&mut buf) }) {
+        match tx.try_send(Raw { seq, data: std::mem::take(&mut buf) }) {
             Ok(()) => {}
             Err(TrySendError::Full(r)) => {
                 // Workers are busy: drop this frame rather than queueing latency.
-                buf = r.jpeg;
+                buf = r.data;
                 dropped.fetch_add(1, Ordering::Relaxed);
             }
             Err(TrySendError::Disconnected(_)) => return,
@@ -260,9 +289,11 @@ fn capture_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn worker_loop(
     w: u32,
     h: u32,
+    fmt: Format,
     rx: &Mutex<Receiver<Raw>>,
     tx: &Sender<Processed>,
     corr: &RwLock<Arc<Correction>>,
@@ -283,19 +314,31 @@ fn worker_loop(
             Err(_) => return,
         };
         let t0 = Instant::now();
-        let Some((lin, v)) = proc::decode(dec.as_mut(), raw.jpeg, w, h) else {
-            // Truncated / corrupt MJPEG frames happen on USB; just skip them.
-            continue;
+        let (lin, y_plane, y_stride) = match fmt {
+            Format::Bayer8 => {
+                if raw.data.len() < w * h {
+                    continue;
+                }
+                let (lin, luma) = proc::debayer(&raw.data[..w * h], w, h);
+                (lin, luma, w)
+            }
+            Format::Mjpeg => {
+                let Some((lin, mut v)) = proc::decode(dec.as_mut(), raw.data, w, h) else {
+                    // Truncated / corrupt MJPEG frames happen on USB; just skip them.
+                    continue;
+                };
+                let stride = v.planes[0].stride;
+                (lin, std::mem::take(&mut v.planes[0].data), stride)
+            }
         };
-        let yuv_y = (&v.planes[0].data, v.planes[0].stride);
+        let yuv_y = (&y_plane, y_stride);
         let c = corr.read().unwrap().clone();
         let raw_copy = want_raw.load(Ordering::Relaxed).then(|| lin.clone());
         let mut corrected = lin;
         proc::apply_correction(&mut corrected, &c);
         let levels = c.levels.unwrap_or_else(|| proc::auto_levels(&corrected));
         let rgba = proc::render_display(&corrected, levels, c.peaking, 0.12);
-        let clipped = v.planes[0].data.iter().step_by(31).filter(|&&b| b >= 250).count() as f32
-            / (v.planes[0].data.len() / 31).max(1) as f32;
+        let clipped = y_plane.iter().step_by(31).filter(|&&b| b >= 250).count() as f32 / (y_plane.len() / 31).max(1) as f32;
         let (focus_grid, focus) = proc::focus_grid(yuv_y.0, yuv_y.1, w, h);
         let (small, _, _) = proc::small_luma(yuv_y.0, yuv_y.1, w, h);
         let _ = tx.send(Processed {
@@ -370,6 +413,9 @@ fn coordinator(
     let mut prev_small: Vec<f32> = Vec::new();
     let mut last_t = Instant::now();
     let mut fps = 0.0f32;
+    // Mean frame interval: averaging rates instead would let a burst of
+    // workers finishing together dominate.
+    let mut interval = 0.0f32;
     let mut still_run = 0u32;
     let mut job: Option<Job> = None;
     let mut auto_wb = false;
@@ -406,8 +452,9 @@ fn coordinator(
         let now = Instant::now();
         let dt = now.duration_since(last_t).as_secs_f32();
         last_t = now;
-        if dt > 0.0 {
-            fps = if fps == 0.0 { 1.0 / dt } else { fps * 0.9 + 0.1 / dt };
+        interval = if interval == 0.0 { dt } else { interval * 0.9 + 0.1 * dt };
+        if interval > 0.0 {
+            fps = 1.0 / interval;
         }
         fwd.send(p.seq, &p.corr);
         let motion = proc::motion(&p.small, &prev_small);
