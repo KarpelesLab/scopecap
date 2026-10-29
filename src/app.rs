@@ -81,6 +81,8 @@ pub struct App {
     project: Option<(PathBuf, Project)>,
     /// "Next zoom" pressed: waiting for the user to change objective.
     pending_zoom: Option<f32>,
+    /// Held while scanning: no screensaver.
+    awake: Option<crate::awake::KeepAwake>,
 }
 
 const HIST: usize = 240;
@@ -114,6 +116,7 @@ impl App {
             },
             project: None,
             pending_zoom: None,
+            awake: None,
         };
         if let Err(e) = app.open_camera(cc.egui_ctx.clone()) {
             app.error = Some(format!("{e:#}"));
@@ -180,6 +183,10 @@ impl eframe::App for App {
             self.settings.wbs.insert(cam.dev.key().into(), self.settings.wb);
         }
         let before = self.settings.clone();
+        let scanning = self.cam.as_ref().is_some_and(|c| c.is_scanning());
+        if scanning != self.awake.is_some() {
+            self.awake = scanning.then(crate::awake::KeepAwake::new);
+        }
 
         // Pull the latest state from the pipeline.
         let mut stats = Stats::default();

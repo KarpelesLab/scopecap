@@ -224,6 +224,10 @@ impl Camera {
         self.mosaic_cmd(mosaic::Msg::Clear);
     }
 
+    pub fn is_scanning(&self) -> bool {
+        self.scanning.load(Ordering::Relaxed)
+    }
+
     pub fn session(&self) -> Option<&Recorder> {
         self.session.as_ref().map(|s| &s.0)
     }

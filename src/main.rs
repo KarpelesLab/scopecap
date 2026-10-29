@@ -1,6 +1,7 @@
 mod align;
 mod app;
 mod autoflat;
+mod awake;
 mod camera;
 mod composite;
 mod config;
