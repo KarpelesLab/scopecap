@@ -54,6 +54,14 @@ const SEARCH_EVERY: u32 = 8;
 const NEAR_MIN_REL: f32 = 0.8;
 /// Consecutive still frames required before pasting resumes after motion.
 const SETTLE_FRAMES: u32 = 2;
+/// Radius (in 1/SMALL cells, so ×SMALL px) over which a spot's sharpness
+/// carries to its surroundings when choosing between focus levels.
+const FOCUS_SPREAD: usize = 4;
+/// Sharpness advantage of a frame whose position was confirmed on the lower
+/// layer over one that wasn't.
+const CONF_FAVOUR: f32 = 2.0;
+/// Frame gaps beyond this (a pause) don't spread motion any thinner.
+const MAX_GAP: u64 = 30;
 /// Settled frames that may wait for the post-move check against the lower
 /// layer before being pasted anyway (as low confidence).
 const VERIFY_TRIES: u32 = 10;
@@ -462,6 +470,8 @@ pub struct Mosaic {
     /// The view has moved since the position was last confirmed over a wide
     /// area of the lower layer; counts settled frames spent waiting.
     unverified: Option<u32>,
+    /// Camera frame number of the last frame processed.
+    last_seq: Option<u64>,
 }
 
 struct LayerRt {
@@ -492,7 +502,7 @@ pub fn run(rx: Receiver<Msg>, shared: Arc<Mutex<Shared>>, pending: Arc<AtomicUsi
                 }
                 let t0 = Instant::now();
                 let merges_before = m.merges.len();
-                let (touched, peak, speed) = m.process(&f);
+                let (touched, peak, speed) = m.process(&f, seq);
                 if let Some(r) = &m.rec {
                     let _ = r.tx.send(Rec::Track(TrackRec {
                         seq,
@@ -741,6 +751,7 @@ impl Mosaic {
             last_ff: [0.0; 2],
             disagree: 0,
             unverified: None,
+            last_seq: None,
         }
     }
 
@@ -797,10 +808,17 @@ impl Mosaic {
         1 + self.others.len()
     }
 
-    /// Track one corrected frame and paste it if it is usable.
+    /// Track one corrected frame and paste it if it is usable. `seq` is the
+    /// camera's frame number: frames skipped while busy don't count as
+    /// motion within one frame.
     /// Returns (tiles touched, match peak-to-noise, speed in px/frame).
-    pub fn process(&mut self, f: &Lin) -> (Vec<(i32, i32)>, f32, f32) {
+    pub fn process(&mut self, f: &Lin, seq: u64) -> (Vec<(i32, i32)>, f32, f32) {
         self.seen += 1;
+        let gap = match self.last_seq {
+            Some(l) if seq > l => (seq - l).min(MAX_GAP) as f32,
+            _ => 1.0,
+        };
+        self.last_seq = Some(seq);
         let (w, h) = (f.w, f.h);
         let g = green(f);
         let (small, sw, sh) = downsample(&g, w, h, SMALL);
@@ -976,7 +994,7 @@ impl Mosaic {
         let mut pos = pos;
         // Motion as tracked (before any correction): used for speed gating
         // and, accumulated between checks, for learning the layer scale.
-        let speed = ((pos[0] - prev_pos[0]).powi(2) + (pos[1] - prev_pos[1]).powi(2)).sqrt() as f32;
+        let speed = ((pos[0] - prev_pos[0]).powi(2) + (pos[1] - prev_pos[1]).powi(2)).sqrt() as f32 / gap;
         if from_reference {
             self.ref_last = None;
         } else {
@@ -1240,9 +1258,13 @@ impl Mosaic {
                 *o = acc;
             }
         });
-        for _ in 0..2 {
-            s = box_blur(&s, sw, sh, 2);
-        }
+        // Spread each spot's strongest detail over its surroundings (local
+        // maximum, not average): around an in-focus edge the image is flat,
+        // while a defocused frame smears the edge into exactly that ring and
+        // would otherwise win there (dark halos, doubled outlines). Then a
+        // light blur for smooth transitions.
+        s = max_filter(&s, sw, sh, FOCUS_SPREAD);
+        s = box_blur(&s, sw, sh, 2);
         let mut sorted = s.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let median = sorted[sorted.len() / 2];
@@ -1298,12 +1320,19 @@ impl Mosaic {
                     let i = (y - ty0) as usize * T + (x - tx0) as usize;
                     let so = tile.sharp[i];
                     let co = tile.conf[i];
-                    let a = if so < 0.0 || conf > co {
+                    // Focus decides; confidence (position checked against the
+                    // lower layer) weighs in as a factor, so a confirmed but
+                    // blurry frame doesn't wipe out a sharp one, nor the
+                    // reverse.
+                    let a = if so < 0.0 {
                         1.0
-                    } else if conf < co {
-                        continue;
                     } else {
-                        let r = (so + floor) / (sn + floor);
+                        let favour = match conf.cmp(&co) {
+                            std::cmp::Ordering::Greater => CONF_FAVOUR,
+                            std::cmp::Ordering::Less => 1.0 / CONF_FAVOUR,
+                            std::cmp::Ordering::Equal => 1.0,
+                        };
+                        let r = (so + floor) / ((sn + floor) * favour);
                         let r2 = r * r;
                         1.0 / (1.0 + r2 * r2)
                     };
@@ -1321,8 +1350,8 @@ impl Mosaic {
                         let o = &mut tile.rgb[i * 3 + c];
                         *o = (*o as f32 * (1.0 - a) + nv * a + 0.5) as u16;
                     }
-                    tile.sharp[i] = if conf > co { sn } else { so.max(sn) };
-                    tile.conf[i] = conf;
+                    tile.sharp[i] = so.max(sn);
+                    tile.conf[i] = if a >= 0.5 { conf } else { co };
                 }
             }
             tile.update_low();
@@ -1448,6 +1477,25 @@ pub fn bilinear1(v: &[f32], w: usize, h: usize, x: f32, y: f32) -> f32 {
     let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
     let (tx, ty) = (x - x0 as f32, y - y0 as f32);
     (v[y0 * w + x0] * (1.0 - tx) + v[y0 * w + x1] * tx) * (1.0 - ty) + (v[y1 * w + x0] * (1.0 - tx) + v[y1 * w + x1] * tx) * ty
+}
+
+/// Local maximum over a (2r+1)² window.
+fn max_filter(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+    let mut tmp = vec![0.0; src.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let (a, b) = (x.saturating_sub(r), (x + r).min(w - 1));
+            tmp[y * w + x] = src[y * w + a..=y * w + b].iter().fold(0.0f32, |m, &v| m.max(v));
+        }
+    }
+    let mut out = vec![0.0; src.len()];
+    for y in 0..h {
+        let (a, b) = (y.saturating_sub(r), (y + r).min(h - 1));
+        for x in 0..w {
+            out[y * w + x] = (a..=b).fold(0.0f32, |m, yy| m.max(tmp[yy * w + x]));
+        }
+    }
+    out
 }
 
 fn box_blur(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {

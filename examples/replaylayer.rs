@@ -60,7 +60,7 @@ fn main() -> anyhow::Result<()> {
         let jpeg = stream[f.off as usize..f.off as usize + f.len as usize].to_vec();
         let Some((mut lin, _)) = proc::decode(dec.as_mut(), jpeg, 1920, 1080) else { continue };
         proc::apply_correction(&mut lin, &corr);
-        let (touched, pnr, speed) = m.process(&lin);
+        let (touched, pnr, speed) = m.process(&lin, f.seq);
         let ev = m.take_events();
         println!(
             "{} {:?} {:.1},{:.1} pnr {:.0} speed {:.1} pasted {} {}",

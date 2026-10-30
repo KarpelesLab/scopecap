@@ -650,7 +650,7 @@ fn track(
                 m.reference = reference.take();
                 m
             });
-            let (touched, pnr, speed) = m.process(&img);
+            let (touched, pnr, speed) = m.process(&img, fr.seq);
             let events = m.take_events();
             for e in &events {
                 println!("     frame {}: {e}", fr.seq);
