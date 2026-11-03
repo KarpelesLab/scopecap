@@ -48,7 +48,13 @@ pub struct Opts {
 
 const USAGE: &str = "usage: scopecap render <scan-or-project-dir> [--flat auto|live|none] [--max-speed PX] [--out DIR] [--install-flat] [--no-gains] [--no-align] [--no-join]";
 
+/// Worker stack size. A worker waiting on nested parallel work (frame decode,
+/// correction, sharpness) runs other frames' tasks on top of its own stack,
+/// and with hundreds of frames in flight the default 2 MB overflows.
+const WORKER_STACK: usize = 64 << 20;
+
 pub fn main(args: &[String]) -> Result<()> {
+    rayon::ThreadPoolBuilder::new().stack_size(WORKER_STACK).build_global().context("thread pool")?;
     let mut dir = None;
     let mut o = Opts { flat: FlatMode::Auto, max_speed: 2.0, out: None, install_flat: false, no_join: false, gains: true, align: true };
     let mut it = args.iter();
@@ -261,7 +267,7 @@ fn render_layer(sessions: &[Session], o: &Opts, out: &Path, make_ref: impl Fn() 
     std::fs::create_dir_all(out)?;
     let s0 = &sessions[0];
     let (w, h) = (s0.info.width as usize, s0.info.height as usize);
-    let mut corr = Correction { wb: s0.settings.wb, flat: None, use_flat: true, levels: s0.settings.levels, peaking: false };
+    let mut corr = Correction { wb: s0.settings.wb, flat: None, use_flat: true, levels: s0.settings.levels, peaking: false, clip_white: true };
 
     println!("   tracking");
     let t0 = Instant::now();
@@ -496,6 +502,10 @@ const SEGMENT_MIN: usize = 300;
 /// time its own frames begin (the warm-up results are discarded).
 const SEGMENT_WARMUP: usize = 150;
 
+/// Frames decoded at a time when tracking alone, and in a parallel segment.
+const TRACK_BATCH: usize = 64;
+const SEGMENT_BATCH: usize = 8;
+
 /// Track every frame of every session. Layers registered onto a lower layer
 /// are split into segments tracked in parallel: each frame can be placed
 /// absolutely on the lower layer, so segments don't depend on each other.
@@ -563,10 +573,12 @@ fn pass(
                     for p in parts {
                         let p = p?;
                         out.positions.extend(p.positions);
-                        for (k, v) in p.states {
-                            *out.states.entry(k).or_default() += v;
-                        }
                         out.decode_fail += p.decode_fail;
+                    }
+                    rescue_lost(sessions, &all, corr, o, w, h, make_ref, map, &mut out)?;
+                    out.states = BTreeMap::new();
+                    for f in &out.positions {
+                        *out.states.entry(format!("{:?}", f.state)).or_default() += 1;
                     }
                     out
                 }
@@ -584,6 +596,76 @@ fn pass(
         }
     }
     Ok(r)
+}
+
+/// Shorter lost runs are frames of a quick move, not worth tracking again.
+const RESCUE_MIN_RUN: usize = 30;
+
+/// A parallel segment starts by finding itself on the lower layer. Where the
+/// sample has no features to match that never succeeds, and the frames stay
+/// lost although continuous tracking would have followed the view there. So
+/// track each lost run again, starting from before the last frame verified
+/// on the lower layer.
+#[allow(clippy::too_many_arguments)]
+fn rescue_lost(
+    sessions: &[Session],
+    all: &[(usize, FrameRec, usize)],
+    corr: &Correction,
+    o: &Opts,
+    w: usize,
+    h: usize,
+    make_ref: &(dyn Fn() -> Option<Reference> + Sync),
+    map: Sim,
+    out: &mut PassResult,
+) -> Result<()> {
+    out.positions.sort_by_key(|f| f.index);
+    let pos = &out.positions;
+    // (first frame to track, first lost frame, end of the run), by frame index.
+    let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < pos.len() {
+        if pos[i].state != Track::Lost {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < pos.len() && pos[i].state == Track::Lost {
+            i += 1;
+        }
+        if i - start < RESCUE_MIN_RUN {
+            continue;
+        }
+        if let Some(anchor) = pos[..start].iter().rev().find(|f| f.state == Track::Ok && f.high) {
+            runs.push((anchor.index.saturating_sub(SEGMENT_WARMUP), pos[start].index, pos[i - 1].index + 1));
+        }
+    }
+    if runs.is_empty() {
+        return Ok(());
+    }
+    let lost = pos.iter().filter(|f| f.state == Track::Lost).count();
+    let parts: Vec<Result<Vec<FramePos>>> = runs
+        .par_iter()
+        .map(|&(first, a, b)| {
+            let mut r = make_ref().unwrap();
+            r.map = Some(map);
+            r.frozen = true;
+            let mut p = track(sessions, &all[first..b], corr, o, w, h, Some(r), None, false)?;
+            p.positions.retain(|f| f.index >= a && f.state != Track::Lost);
+            Ok(p.positions)
+        })
+        .collect();
+    let mut found: HashMap<usize, FramePos> = HashMap::new();
+    for p in parts {
+        found.extend(p?.into_iter().map(|f| (f.index, f)));
+    }
+    let recovered = found.len();
+    for f in &mut out.positions {
+        if let Some(n) = found.remove(&f.index) {
+            *f = n;
+        }
+    }
+    println!("     lost frames: tracked {} runs again, recovered {} of {}", runs.len(), recovered, lost);
+    Ok(())
 }
 
 struct Progress {
@@ -622,12 +704,14 @@ fn track(
     let mut states: BTreeMap<String, usize> = BTreeMap::new();
     let mut decode_fail = 0;
     let mut last_session = None;
+    // Segments run side by side, each holding a batch of 60 MB frames.
+    let batch = if reference.as_ref().is_some_and(|r| r.frozen) { SEGMENT_BATCH } else { TRACK_BATCH };
     // Consecutive runs of the same session, decoded in batches.
     let mut i = 0;
     'frames: while i < frames.len() {
         let si = frames[i].0;
         let mut j = i;
-        while j < frames.len() && j - i < 64 && frames[j].0 == si {
+        while j < frames.len() && j - i < batch && frames[j].0 == si {
             j += 1;
         }
         if last_session.is_some_and(|l| l != si) {
@@ -690,18 +774,24 @@ fn track(
     Ok(PassResult { positions, states, decode_fail, merges: m.merges().to_vec(), map: m.layer_map(), islands: m.islands() })
 }
 
+/// Most key frames kept for global alignment (about 5 MB each).
+const ALIGN_MAX_KEYS: usize = 4000;
+
 /// Make the layer self-consistent: register overlapping still frames
-/// pairwise and solve all positions together (see align.rs). Moving frames
-/// get the correction of the nearest still frame.
+/// pairwise and solve all positions together (see align.rs). Only one frame
+/// per position takes part; the others, and moving frames (from the nearest
+/// still frame), get its correction.
 fn global_align(sessions: &[Session], used: &mut [Used], still: &[usize], corr: &Correction, w: usize, h: usize) {
     let t0 = Instant::now();
-    // (index into `used`, frame) for the still frames that decoded.
-    let mut sub: Vec<align::AlignFrame> = Vec::with_capacity(still.len());
-    let mut sub_idx: Vec<usize> = Vec::with_capacity(still.len());
+    let items: Vec<(u32, [f64; 2], u64)> = still.iter().map(|&i| (used[i].group, used[i].pos, used[i].frame.len as u64)).collect();
+    let clusters = align::clusters(&items, ALIGN_MAX_KEYS);
+    // (index into `clusters`, frame) for the key frames that decoded.
+    let mut sub: Vec<align::AlignFrame> = Vec::with_capacity(clusters.len());
+    let mut sub_idx: Vec<usize> = Vec::with_capacity(clusters.len());
     for (si, sess) in sessions.iter().enumerate() {
-        let mine: Vec<usize> = still.iter().copied().filter(|&i| used[i].session == si).collect();
+        let mine: Vec<usize> = (0..clusters.len()).filter(|&c| used[still[clusters[c].key]].session == si).collect();
         for chunk in mine.chunks(256) {
-            let recs: Vec<FrameRec> = chunk.iter().map(|&i| used[i].frame.clone()).collect();
+            let recs: Vec<FrameRec> = chunk.iter().map(|&c| used[still[clusters[c].key]].frame.clone()).collect();
             let imgs: Vec<Option<Vec<f32>>> = decode_batch(&sess.stream, &recs, w, h)
                 .into_par_iter()
                 .map(|img| {
@@ -710,19 +800,28 @@ fn global_align(sessions: &[Session], used: &mut [Used], still: &[usize], corr: 
                     Some(mosaic::downsample(&mosaic::green(&img), w, h, align::DIV).0)
                 })
                 .collect();
-            for (&i, img) in chunk.iter().zip(imgs) {
+            for (&c, img) in chunk.iter().zip(imgs) {
                 if let Some(img) = img {
-                    sub_idx.push(i);
-                    sub.push(align::AlignFrame { group: used[i].group, pos: used[i].pos, img });
+                    let cl = &clusters[c];
+                    let key = &used[still[cl.key]];
+                    let high = cl.members.iter().any(|&m| used[still[m]].high);
+                    sub_idx.push(c);
+                    sub.push(align::AlignFrame { group: key.group, pos: key.pos, high, img });
                 }
             }
         }
     }
     let r = align::align(&mut sub, w, h);
     let mut delta: HashMap<usize, [f64; 2]> = HashMap::new();
-    for (f, &i) in sub.iter().zip(&sub_idx) {
-        delta.insert(i, [f.pos[0] - used[i].pos[0], f.pos[1] - used[i].pos[1]]);
-        used[i].pos = f.pos;
+    for (f, &c) in sub.iter().zip(&sub_idx) {
+        let k = still[clusters[c].key];
+        let d = [f.pos[0] - used[k].pos[0], f.pos[1] - used[k].pos[1]];
+        for &m in &clusters[c].members {
+            let i = still[m];
+            delta.insert(i, d);
+            used[i].pos = [used[i].pos[0] + d[0], used[i].pos[1] + d[1]];
+            used[i].high |= f.high;
+        }
     }
     // Moving frames: shift like the nearest still frame (in recording order).
     let mut last: Option<[f64; 2]> = None;
@@ -742,9 +841,12 @@ fn global_align(sessions: &[Session], used: &mut [Used], still: &[usize], corr: 
         }
     }
     println!(
-        "   global alignment: {} frame pairs, {} consistent; frames moved by {:.1} px median, {:.0} px max ({:.1}s)",
+        "   global alignment: {} key frames of {}, {} frame pairs, {} consistent, {} more verified; frames moved by {:.1} px median, {:.0} px max ({:.1}s)",
+        sub.len(),
+        still.len(),
         r.pairs,
         r.kept,
+        r.promoted,
         r.moved_median,
         r.moved_max,
         t0.elapsed().as_secs_f32()

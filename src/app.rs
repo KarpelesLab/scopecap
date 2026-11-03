@@ -152,6 +152,7 @@ impl App {
             use_flat: self.settings.use_flat,
             levels: self.settings.levels,
             peaking: self.settings.peaking,
+            clip_white: false,
         }
     }
 

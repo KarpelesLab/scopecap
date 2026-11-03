@@ -389,26 +389,33 @@ pub struct Correction {
     /// `None` = auto-stretch every frame.
     pub levels: Option<Levels>,
     pub peaking: bool,
+    /// Clip highlights to neutral (offline rendering). Off when live, where
+    /// Auto WB has to see the true colour of the brightest pixels.
+    pub clip_white: bool,
 }
 
 impl Default for Correction {
     fn default() -> Self {
-        Correction { wb: [1.0; 3], flat: None, use_flat: true, levels: None, peaking: false }
+        Correction { wb: [1.0; 3], flat: None, use_flat: true, levels: None, peaking: false, clip_white: false }
     }
 }
 
 pub fn apply_correction(img: &mut Lin, c: &Correction) {
     let flat = c.flat.as_ref().filter(|f| c.use_flat && f.full_w == img.w && f.full_h == img.h);
     let wb = c.wb;
+    // White balance scales a sensor-clipped channel past or short of the
+    // others, which tints overexposed metal. Their true ratio is unknown, so
+    // clip all channels at the lowest level a clipped one can reach: neutral.
+    let white = if c.clip_white { wb[0].min(wb[1]).min(wb[2]) } else { f32::INFINITY };
     match flat {
         Some(f) => img.data.par_chunks_mut(3).zip(f.inv.par_chunks(3)).for_each(|(p, g)| {
             for k in 0..3 {
-                p[k] *= g[k] * wb[k];
+                p[k] = (p[k] * wb[k]).min(white) * g[k];
             }
         }),
         None => img.data.par_chunks_mut(3).for_each(|p| {
             for k in 0..3 {
-                p[k] *= wb[k];
+                p[k] = (p[k] * wb[k]).min(white);
             }
         }),
     }
@@ -547,6 +554,23 @@ pub fn encode_png16(img: &Lin, lv: Levels) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sensor-clipped red and green with a boosted blue must not turn blue.
+    #[test]
+    fn clipped_highlights_stay_neutral() {
+        let mut c = Correction { wb: [1.0, 0.96, 4.1], flat: None, use_flat: false, levels: None, peaking: false, clip_white: true };
+        let frame = || Lin { w: 2, h: 1, data: vec![1.0, 1.0, 0.3, 0.2, 0.2, 0.05] };
+        let mut img = frame();
+        apply_correction(&mut img, &c);
+        assert!((img.data[0] - img.data[2]).abs() < 1e-6 && (img.data[1] - img.data[2]).abs() < 1e-6);
+        // Below the clip, plain white balance.
+        assert!((img.data[3] - 0.2).abs() < 1e-6 && (img.data[5] - 0.205).abs() < 1e-6);
+        // Live: untouched, for Auto WB.
+        c.clip_white = false;
+        let mut img = frame();
+        apply_correction(&mut img, &c);
+        assert!((img.data[2] - 1.23).abs() < 1e-5);
+    }
 
     /// A smooth coloured scene sampled through an RGGB mosaic comes back
     /// from demosaicing, then through JPEG encode/decode, close to the

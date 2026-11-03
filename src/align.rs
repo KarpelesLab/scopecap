@@ -25,13 +25,55 @@ const OUTLIER_PX: f64 = 3.0;
 pub struct AlignFrame {
     pub group: u32,
     pub pos: [f64; 2],
+    /// Position verified against the lower layer. Also set by `align` on
+    /// frames tied to a verified one by a chain of consistent measurements.
+    pub high: bool,
     /// Green channel at 1/DIV resolution.
     pub img: Vec<f32>,
+}
+
+/// Frames recorded at (nearly) the same spot, of which only `key` is aligned.
+pub struct Cluster {
+    pub key: usize,
+    pub members: Vec<usize>,
+}
+
+/// Size of the position cells frames are clustered in, before any widening.
+const CELL_PX: f64 = 8.0;
+
+/// Most recorded frames are near-duplicates, as the stage sits still between
+/// moves, and each aligned frame holds an image in memory. Group frames by
+/// position, given as (group, position, JPEG size), widening the cells until
+/// at most `max` clusters remain. The key frame is the largest JPEG: at the
+/// same spot and quality that is the sharpest one, without decoding anything.
+pub fn clusters(items: &[(u32, [f64; 2], u64)], max: usize) -> Vec<Cluster> {
+    let mut cell = CELL_PX;
+    loop {
+        let mut by_cell: HashMap<(u32, i64, i64), Vec<usize>> = HashMap::new();
+        for (i, it) in items.iter().enumerate() {
+            let k = (it.0, (it.1[0] / cell).floor() as i64, (it.1[1] / cell).floor() as i64);
+            by_cell.entry(k).or_default().push(i);
+        }
+        if by_cell.len() <= max.max(1) {
+            let mut out: Vec<Cluster> = by_cell
+                .into_values()
+                .map(|members| {
+                    let key = *members.iter().max_by_key(|&&i| (items[i].2, std::cmp::Reverse(i))).unwrap();
+                    Cluster { key, members }
+                })
+                .collect();
+            out.sort_by_key(|c| c.key);
+            return out;
+        }
+        cell *= 2.0;
+    }
 }
 
 pub struct Report {
     pub pairs: usize,
     pub kept: usize,
+    /// Frames newly marked verified through their measurements.
+    pub promoted: usize,
     /// Median and largest position change (full-resolution px).
     pub moved_median: f64,
     pub moved_max: f64,
@@ -136,10 +178,31 @@ pub fn align(frames: &mut [AlignFrame], w: usize, h: usize) -> Report {
     for (f, p) in frames.iter_mut().zip(&x) {
         f.pos = *p;
     }
+    // A consistent chain of measurements to a verified frame verifies a frame
+    // too: this is what places areas too plain to match on the lower layer.
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (e, &(i, j, _, _)) in edges.iter().enumerate() {
+        if keep[e] {
+            adj[i].push(j);
+            adj[j].push(i);
+        }
+    }
+    let mut todo: Vec<usize> = (0..n).filter(|&i| frames[i].high).collect();
+    let mut promoted = 0;
+    while let Some(i) = todo.pop() {
+        for &j in &adj[i] {
+            if !frames[j].high {
+                frames[j].high = true;
+                promoted += 1;
+                todo.push(j);
+            }
+        }
+    }
     moved.sort_by(|a, b| a.partial_cmp(b).unwrap());
     Report {
         pairs: edges.len(),
         kept: keep.iter().filter(|k| **k).count(),
+        promoted,
         moved_median: moved.get(moved.len() / 2).copied().unwrap_or(0.0),
         moved_max: moved.last().copied().unwrap_or(0.0),
     }
@@ -244,15 +307,40 @@ mod tests {
                 .collect();
             // Every third frame starts 24 px off, like a period slip.
             let err = if k % 3 == 1 { 24.0 } else { 0.0 };
-            frames.push(AlignFrame { group: 0, pos: [px as f64 + err, py as f64 - err], img });
+            frames.push(AlignFrame { group: 0, pos: [px as f64 + err, py as f64 - err], high: k == 0, img });
             truth.push([px as f64, py as f64]);
         }
-        align(&mut frames, w, h);
+        let r = align(&mut frames, w, h);
+        // The verified frame verifies its row, chained by measurements. The
+        // rows overlap too little to be measured, so the other one stays
+        // unverified, whatever it looks like.
+        assert_eq!(r.promoted, 5);
+        assert!(frames.iter().enumerate().all(|(k, f)| f.high == (k < 6)));
         // Positions are only defined up to a common shift: compare relative.
         let off = [frames[0].pos[0] - truth[0][0], frames[0].pos[1] - truth[0][1]];
         for (f, t) in frames.iter().zip(&truth) {
             let e = ((f.pos[0] - off[0] - t[0]).powi(2) + (f.pos[1] - off[1] - t[1]).powi(2)).sqrt();
             assert!(e < 1.5, "frame off by {e:.2} px");
         }
+    }
+
+    #[test]
+    fn clusters_keep_sharpest_and_respect_limit() {
+        let items = [
+            (0, [1.0, 1.0], 100),
+            (0, [2.0, 2.0], 300),
+            (0, [3.0, 3.0], 200),
+            (0, [100.0, 1.0], 50),
+            (1, [1.0, 1.0], 10),
+        ];
+        let c = clusters(&items, 10);
+        assert_eq!(c.len(), 3);
+        let spot = c.iter().find(|c| c.members.contains(&0)).unwrap();
+        assert_eq!(spot.key, 1);
+        assert_eq!(spot.members.len(), 3);
+        // Too many: cells widen until the limit holds, groups stay apart.
+        let c = clusters(&items, 2);
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.iter().map(|c| c.members.len()).sum::<usize>(), items.len());
     }
 }
