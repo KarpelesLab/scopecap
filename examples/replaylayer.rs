@@ -50,15 +50,16 @@ fn main() -> anyhow::Result<()> {
     let canvas = Arc::new(mosaic::Canvas::from_rgba_tiles(tiles));
     let frames: Vec<recorder::FrameRec> = recorder::read_jsonl(&sdir.join("frames.jsonl"))?;
     let stream = std::fs::read(sdir.join("stream.mjpeg"))?;
-    let mut dec = proc::make_decoder(1920, 1080).map_err(|e| anyhow::anyhow!("{e}"))?;
     let settings: serde_json::Value = serde_json::from_slice(&std::fs::read(sdir.join("session.json"))?)?;
+    let (w, h) = (settings["width"].as_u64().unwrap_or(1920) as usize, settings["height"].as_u64().unwrap_or(1080) as usize);
+    let mut dec = proc::make_decoder(w as u32, h as u32).map_err(|e| anyhow::anyhow!("{e}"))?;
     let wb: Vec<f32> = settings["settings"]["wb"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect();
     let corr = proc::Correction { wb: [wb[0], wb[1], wb[2]], ..Default::default() };
     let mut m = mosaic::Mosaic::new(proc::Levels { lo: 0.0, hi: 1.0 }, 2.0);
     m.reference = Some(reference::Reference::new(canvas, pmag / mag, None, map));
     for f in frames.iter().take(limit) {
         let jpeg = stream[f.off as usize..f.off as usize + f.len as usize].to_vec();
-        let Some((mut lin, _)) = proc::decode(dec.as_mut(), jpeg, 1920, 1080) else { continue };
+        let Some((mut lin, _)) = proc::decode(dec.as_mut(), jpeg, w, h) else { continue };
         proc::apply_correction(&mut lin, &corr);
         let (touched, pnr, speed) = m.process(&lin, f.seq);
         let ev = m.take_events();

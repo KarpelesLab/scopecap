@@ -590,8 +590,12 @@ fn pass(
                     }
                     out
                 }
-                // Couldn't calibrate early on: track it all sequentially.
-                None => track(sessions, &all, corr, o, w, h, make_ref(), Some(&progress), false)?,
+                // Couldn't calibrate early on: track it all sequentially
+                // (from the first frame again, so the count restarts).
+                None => {
+                    progress.done.store(0, Ordering::Relaxed);
+                    track(sessions, &all, corr, o, w, h, make_ref(), Some(&progress), false)?
+                }
             }
         }
         r => track(sessions, &all, corr, o, w, h, r, Some(&progress), false)?,

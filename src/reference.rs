@@ -37,6 +37,32 @@ const LOWPASS: f32 = 0.15;
 /// low-magnification image it is compared with.
 const MIN_NCC: f32 = 0.75;
 const MIN_PNR: f32 = 16.0;
+/// Out-of-focus areas (e.g. beyond the die edge at 50x) can be dark at one
+/// magnification and bright at the other, which drags the whole-frame NCC of
+/// a correct match down to 0.1–0.6. Such a match is still accepted when at
+/// least this many blocks of a 4×3 grid reach `MIN_NCC` on their own (wrong
+/// matches seen: none above 0.3).
+const MIN_GOOD_BLOCKS: usize = 3;
+
+/// Edge image: gradient magnitude of the log brightness, for the coarse
+/// whole-layer search when the brightness search fails: where brightness is
+/// inverted between layers (see `MIN_GOOD_BLOCKS`) so are the edges, and at
+/// low resolution the die outline dominates. The log makes it independent
+/// of the illumination level. NaN propagates.
+fn edges(a: &[f32], w: usize, h: usize) -> Vec<f32> {
+    let l: Vec<f32> = a.iter().map(|v| v.max(1e-4).ln()).collect();
+    let mut out = vec![0f32; w * h];
+    for y in 0..h {
+        let (y0, y1) = (y.saturating_sub(1), (y + 1).min(h - 1));
+        for x in 0..w {
+            let (x0, x1) = (x.saturating_sub(1), (x + 1).min(w - 1));
+            let gx = l[y * w + x1] - l[y * w + x0];
+            let gy = l[y1 * w + x] - l[y0 * w + x];
+            out[y * w + x] = (gx * gx + gy * gy).sqrt();
+        }
+    }
+    out
+}
 
 pub struct Reference {
     canvas: Arc<Canvas>,
@@ -116,6 +142,27 @@ fn ncc(a: &[f32], b: &[f32]) -> f32 {
     sab / (saa * sbb).sqrt().max(1e-12)
 }
 
+/// `ncc` per block of a 4×3 grid (blocks without enough data left out).
+fn block_ncc(a: &[f32], b: &[f32], w: usize, h: usize) -> Vec<f32> {
+    let (bw, bh) = (w / 4, h / 3);
+    let mut v = Vec::new();
+    for by in 0..3 {
+        for bx in 0..4 {
+            let mut ca = Vec::with_capacity(bw * bh);
+            let mut cb = Vec::with_capacity(bw * bh);
+            for y in by * bh..(by + 1) * bh {
+                ca.extend_from_slice(&a[y * w + bx * bw..y * w + (bx + 1) * bw]);
+                cb.extend_from_slice(&b[y * w + bx * bw..y * w + (bx + 1) * bw]);
+            }
+            let n = ncc(&ca, &cb);
+            if n != 0.0 {
+                v.push(n);
+            }
+        }
+    }
+    v
+}
+
 impl Reference {
     pub fn new(canvas: Arc<Canvas>, nominal: f64, hint: Option<[f64; 2]>, map: Option<Sim>) -> Self {
         Reference { canvas, nominal, map, hint, scales: Vec::new(), pcs: HashMap::new(), failed: 0, frozen: false }
@@ -169,10 +216,15 @@ impl Reference {
         let c = self.region(qd[0].round() as i64, qd[1].round() as i64, fw, fh, div);
         let n = ncc(&c, f);
         let q = [qd[0] * d, qd[1] * d];
+        let good = if n < MIN_NCC {
+            block_ncc(&c, f, fw, fh).iter().filter(|&&b| b >= MIN_NCC).count()
+        } else {
+            0
+        };
         if debug {
-            eprintln!("  locate {fw}x{fh} /{div} in {rw}x{rh} at {guess:?}: pnr {:.1} → {q:?}, ncc {n:.3}", m.pnr);
+            eprintln!("  locate {fw}x{fh} /{div} in {rw}x{rh} at {guess:?}: pnr {:.1} → {q:?}, ncc {n:.3}, good blocks {good} {:.2?}", m.pnr, block_ncc(&c, f, fw, fh));
         }
-        if n < MIN_NCC {
+        if n < MIN_NCC && good < MIN_GOOD_BLOCKS {
             return None;
         }
         Some((q, m.pnr))
@@ -190,9 +242,13 @@ impl Reference {
 
     /// Whole-reference search at 1/LOW resolution (using the canvas tile
     /// thumbnails), at scale `s`. Returns a rough frame origin.
-    fn global(&mut self, g: &[f32], w: usize, h: usize, s: f64) -> Option<[f64; 2]> {
-        let (f, fw, fh) = shrink(g, w, h, s / LOW as f64);
+    fn global(&mut self, g: &[f32], w: usize, h: usize, s: f64, edge: bool) -> Option<[f64; 2]> {
+        let (mut f, fw, fh) = shrink(g, w, h, s / LOW as f64);
         let (mut a, lw, lh, lx0, ly0) = self.canvas.low_image(fw, fh)?;
+        if edge {
+            f = edges(&f, fw, fh);
+            a = edges(&a, lw, lh);
+        }
         let covered = a.iter().filter(|v| !v.is_nan()).count();
         if covered == 0 {
             return None;
@@ -216,7 +272,7 @@ impl Reference {
         let pc = self.pcs.entry((lw, lh, false)).or_insert_with(|| PhaseCorr::new_unwindowed(lw, lh, LOWPASS));
         let m = pc.correlate(&a, &b);
         if std::env::var_os("SCOPECAP_DEBUG_REF").is_some() {
-            eprintln!("  global {fw}x{fh} in {lw}x{lh}: pnr {:.1}", m.pnr);
+            eprintln!("  global{} {fw}x{fh} in {lw}x{lh}: pnr {:.1}", if edge { " (edges)" } else { "" }, m.pnr);
         }
         if m.pnr < MIN_PNR {
             return None;
@@ -243,22 +299,29 @@ impl Reference {
 
     fn calibrate_once(&mut self, g: &[f32], w: usize, h: usize) -> Option<Sim> {
         let centre = |s: f64| [s * w as f64 / 2.0, s * h as f64 / 2.0];
-        let hint = match self.hint {
-            Some(hc) => hc,
-            None => {
-                // No idea where we are: search the whole reference at 1/LOW.
-                let q = self.global(g, w, h, self.nominal)?;
-                let s = self.nominal;
-                [q[0] + centre(s)[0], q[1] + centre(s)[1]]
-            }
-        };
-        // 1. Position at (roughly) the nominal scale, searching ±1 frame.
+        // 1. Position at (roughly) the nominal scale, searching ±1 frame
+        // around the hint or, with no idea where we are, around the best
+        // whole-reference match at 1/LOW (brightness first, then edges).
         let mut found = None;
-        for k in [0.0, 0.03, -0.03, 0.06, -0.06] {
-            let s = self.nominal * (1.0 + k);
-            let (f, fw, fh) = shrink(g, w, h, s / 2.0);
-            if let Some((q, _)) = self.locate(&f, fw, fh, [hint[0] - centre(s)[0], hint[1] - centre(s)[1]], 1.0, 2) {
-                found = Some((s, q));
+        for edge in [false, true] {
+            let hint = match self.hint {
+                Some(hc) if !edge => hc,
+                Some(_) => break,
+                None => {
+                    let Some(q) = self.global(g, w, h, self.nominal, edge) else { continue };
+                    let s = self.nominal;
+                    [q[0] + centre(s)[0], q[1] + centre(s)[1]]
+                }
+            };
+            for k in [0.0, 0.03, -0.03, 0.06, -0.06] {
+                let s = self.nominal * (1.0 + k);
+                let (f, fw, fh) = shrink(g, w, h, s / 2.0);
+                if let Some((q, _)) = self.locate(&f, fw, fh, [hint[0] - centre(s)[0], hint[1] - centre(s)[1]], 1.0, 2) {
+                    found = Some((s, q));
+                    break;
+                }
+            }
+            if found.is_some() {
                 break;
             }
         }
@@ -315,9 +378,11 @@ impl Reference {
     /// then confirmed at half resolution). Returns the reference origin.
     pub fn find(&mut self, g: &[f32], w: usize, h: usize) -> Option<[f64; 2]> {
         let map = self.map?;
-        let rough = self.global(g, w, h, map.s)?;
         let (f, fw, fh) = shrink(g, w, h, map.s / 2.0);
-        self.locate(&f, fw, fh, rough, 0.3, 2).map(|(q, _)| q)
+        [false, true].into_iter().find_map(|edge| {
+            let rough = self.global(g, w, h, map.s, edge)?;
+            self.locate(&f, fw, fh, rough, 0.3, 2).map(|(q, _)| q)
+        })
     }
 
     /// Number of scale measurements so far (see `observe_motion`).

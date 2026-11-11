@@ -48,13 +48,33 @@ fn main() -> anyhow::Result<()> {
     println!("bounds {:?}", canvas.bounds);
     for f in frames {
         let jpeg = std::fs::read(&f)?;
-        let mut dec = proc::make_decoder(1920, 1080).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let (lin, _) = proc::decode(dec.as_mut(), jpeg, 1920, 1080).unwrap();
+        let (w, h) = jpeg_size(&jpeg).ok_or_else(|| anyhow::anyhow!("{f}: no JPEG frame header"))?;
+        let mut dec = proc::make_decoder(w as u32, h as u32).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (lin, _) = proc::decode(dec.as_mut(), jpeg, w, h).unwrap();
         let g: Vec<f32> = lin.data.chunks(3).map(|p| p[1]).collect();
         let mut r = reference::Reference::new(canvas.clone(), nominal, hint, None);
         let t0 = std::time::Instant::now();
-        let m = r.calibrate(&g, 1920, 1080);
+        let m = r.calibrate(&g, w, h);
         println!("{f}: {:?} in {:.2}s", m, t0.elapsed().as_secs_f32());
     }
     Ok(())
+}
+
+/// Frame size from the first SOF marker.
+fn jpeg_size(j: &[u8]) -> Option<(usize, usize)> {
+    let mut i = 2;
+    while i + 9 < j.len() {
+        if j[i] != 0xFF {
+            return None;
+        }
+        let m = j[i + 1];
+        let len = u16::from_be_bytes([j[i + 2], j[i + 3]]) as usize;
+        if (0xC0..=0xC3).contains(&m) {
+            let h = u16::from_be_bytes([j[i + 5], j[i + 6]]) as usize;
+            let w = u16::from_be_bytes([j[i + 7], j[i + 8]]) as usize;
+            return Some((w, h));
+        }
+        i += 2 + len;
+    }
+    None
 }
