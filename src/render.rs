@@ -207,7 +207,15 @@ fn run_project(dir: &Path, o: &Opts) -> Result<()> {
                 })
         };
         let ldir = out.join(&layer.dir);
-        let mut r = render_layer(&sessions, o, &ldir, make_ref)?;
+        // A layer that fails (e.g. never located on the one below) must not
+        // throw away the layers already rendered: skip it.
+        let mut r = match render_layer(&sessions, o, &ldir, make_ref) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("   layer skipped: {e:#}");
+                continue;
+            }
+        };
         let map = r.map;
         if let Some(m) = map {
             println!("   mapping onto parent: scale {:.5}, offset ({:.1}, {:.1})", m.s, m.tx, m.ty);
